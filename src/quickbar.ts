@@ -4,7 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
-import { config, ensure, onRecord, pi, setTag } from "./pi";
+import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
 import { renderMd, wireCopy } from "./md";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -66,6 +66,8 @@ async function boot() {
   } catch { /* ignore */ }
   inp.focus();
   autofit();
+  // First open behaves like a toggle: start clean, don't continue history.
+  freshSession().catch(() => {});
 
   inp.addEventListener("keydown", async (e) => {
     if (e.key === "Enter") {
@@ -119,7 +121,8 @@ async function ask() {
   const c = await config.get().catch(() => null);
   if (c?.last_cwd) cwd = c.last_cwd;
   try {
-    await ensure(cwd);
+    await ensure(cwd, qbKey || undefined, null);
+    if (qbKey) setKey(qbKey);
   } catch (e: any) {
     setStatus(`pi failed: ${e.message ?? e}`);
     busy = false;
@@ -200,18 +203,22 @@ async function autofit() {
 // can never land on the pre-switch (old) session.
 let freshPending: Promise<void> | null = null;
 
+// Own backend child per toggle (unique key): the previous toggle's child
+// keeps running untouched if it was mid-run; this one starts clean.
+let qbKey = "";
+
 // Reset UI + start a new pi session for this cwd.
 async function freshSession() {
   if (freshPending) return freshPending;
   freshPending = (async () => {
   const c = await config.get().catch(() => null);
   if (c?.last_cwd) cwd = c.last_cwd;
+  if (qbKey) await stopChild(cwd, qbKey).catch(() => {});
   busy = false;
-  try {
-    await pi.abort(cwd);
-  } catch { /* nothing streaming */ }
   buf = "";
   lastText = "";
+  qbKey = `qb-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  setKey(qbKey);
   ensureSub();
   ($("qbinput") as HTMLInputElement).value = "";
   const a = $("qbanswer");
@@ -221,7 +228,7 @@ async function freshSession() {
   ($("qbcopier") as HTMLButtonElement).classList.add("hidden");
   ($("qbopen") as HTMLButtonElement).classList.add("hidden");
   try {
-    await ensure(cwd);
+    await ensure(cwd, qbKey, null);
     const before: string | null = await pi.state(cwd).then((s: any) => s?.sessionFile ?? null).catch(() => null);
     await pi.newSession(cwd);
     // new_session ACKs immediately but switches asynchronously: poll until

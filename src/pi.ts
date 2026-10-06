@@ -13,6 +13,17 @@ export function setTag(t: string): void {
   NS = t;
 }
 
+// Currently viewed session key. Backend children are keyed (tag, key), so
+// each session runs in its own pi process and view switches are purely
+// visual — agent state is never touched by navigating the UI.
+let curKey = "";
+export function setKey(k: string): void {
+  curKey = k;
+}
+export function getKey(): string {
+  return curKey;
+}
+
 let seq = 0;
 const pending = new Map<string, { res: (v: any) => void; rej: (e: any) => void }>();
 const subs = new Map<string, Set<(rec: any) => void>>();
@@ -27,8 +38,11 @@ export async function ensureListening(): Promise<void> {
   listening = true;
   await listen("pi-record", (e: any) => {
     const p = e.payload ?? {};
-    const { cwd, tag, record } = p;
+    const { cwd, tag, key, record } = p;
     if (tag !== NS) return;
+    // Render only the currently viewed session. Other sessions keep
+    // running; their UI refreshes when viewed (full reload from messages).
+    if (key !== undefined && key !== curKey && !(record && record.type === "response")) return;
     if (
       record &&
       record.type === "response" &&
@@ -63,7 +77,7 @@ async function call(cwd: string, obj: any, timeoutMs = 120_000): Promise<any> {
   obj.id = id;
   return new Promise((res, rej) => {
     pending.set(id, { res, rej });
-    invoke("pi_send", { cwd, payload: obj, tag: NS }).catch((err) => {
+    invoke("pi_send", { cwd, payload: obj, tag: NS, key: curKey }).catch((err) => {
       pending.delete(id);
       rej(err);
     });
@@ -76,8 +90,18 @@ async function call(cwd: string, obj: any, timeoutMs = 120_000): Promise<any> {
   });
 }
 
-export async function ensure(cwd: string): Promise<void> {
-  await invoke("pi_ensure", { cwd, sessionDir: null, tag: NS });
+export async function ensure(cwd: string, key?: string, sessionPath?: string | null): Promise<void> {
+  await invoke("pi_ensure", {
+    cwd,
+    sessionDir: null,
+    tag: NS,
+    key: key ?? curKey,
+    sessionPath: sessionPath ?? null,
+  });
+}
+
+export async function stopChild(cwd: string, key: string): Promise<void> {
+  await invoke("pi_stop", { cwd, tag: NS, key });
 }
 
 export const pi = {

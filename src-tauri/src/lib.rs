@@ -126,16 +126,20 @@ fn proc_alive(p: &PiProc) -> bool {
 }
 
 /// Spawn (or reuse) a `pi --mode rpc` child rooted at `cwd`.
-fn proc_key(tag: &Option<String>, cwd: &str) -> String {
-    format!("{}\n{}", tag.clone().unwrap_or_else(|| "main".to_string()), cwd)
+/// Child identity: (window tag, session key). One pi child per session, so
+/// runs proceed independently and switching views never touches agent state.
+/// `key` is the session file path when known, else a unique fresh id.
+/// `cwd` is only the process working directory for spawning.
+fn proc_key(tag: &Option<String>, key: &str) -> String {
+    format!("{}\n{}", tag.clone().unwrap_or_else(|| "main".to_string()), key)
 }
 
 #[tauri::command]
-fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, app: AppHandle, state: State<AppState>) -> Result<String, String> {
-    let key = proc_key(&tag, &cwd);
+fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key: String, session_path: Option<String>, app: AppHandle, state: State<AppState>) -> Result<String, String> {
+    let pkey = proc_key(&tag, &key);
     {
         let procs = state.procs.lock().map_err(|e| e.to_string())?;
-        if let Some(p) = procs.get(&key) {
+        if let Some(p) = procs.get(&pkey) {
             if proc_alive(p) {
                 return Ok("running".into());
             }
@@ -144,7 +148,7 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, app:
     // Reap dead proc if present.
     {
         let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
-        procs.remove(&key);
+        procs.remove(&pkey);
     }
 
     // Make sure the dir exists (default Q&A dir may not yet).
@@ -162,14 +166,24 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, app:
             cmd.arg("--session-dir").arg(sd);
         }
     }
+    // Resume a specific session file when given; otherwise pi starts fresh
+    // (which for an existing dir means continuing its most recent session
+    // — callers pass an explicit fresh flow instead when they want new).
+    if let Some(sp) = session_path {
+        if !sp.is_empty() {
+            cmd.arg("--session").arg(sp);
+        }
+    }
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pi: {e}"))?;
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
 
-    // Forward every stdout JSONL record to the frontend with its cwd.
+    // Forward every stdout JSONL record tagged with its session key, so
+    // each window renders only its currently viewed session.
     let app2 = app.clone();
     let cwd2 = cwd.clone();
     let tag2 = tag.clone().unwrap_or_else(|| "main".to_string());
+    let key2 = key.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -184,14 +198,14 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, app:
                 serde_json::from_str(&line).unwrap_or(serde_json::Value::String(line));
             let _ = app2.emit(
                 "pi-record",
-                serde_json::json!({ "cwd": cwd2, "tag": tag2, "record": record }),
+                serde_json::json!({ "cwd": cwd2, "tag": tag2, "key": key2, "record": record }),
             );
         }
     });
 
     let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
     procs.insert(
-        key,
+        pkey,
         PiProc {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -218,9 +232,9 @@ fn push_recent(mut recents: Vec<String>, cwd: &str) -> Vec<String> {
 
 /// Write one JSON command line to the pi child for `cwd`.
 #[tauri::command]
-fn pi_send(cwd: String, payload: serde_json::Value, tag: Option<String>, state: State<AppState>) -> Result<(), String> {
+fn pi_send(_cwd: String, payload: serde_json::Value, tag: Option<String>, key: String, state: State<AppState>) -> Result<(), String> {
     let procs = state.procs.lock().map_err(|e| e.to_string())?;
-    let p = procs.get(&proc_key(&tag, &cwd)).ok_or("no pi running for this dir (call pi_ensure)")?;
+    let p = procs.get(&proc_key(&tag, &key)).ok_or("no pi running for this session (call pi_ensure)")?;
     if !proc_alive(p) {
         return Err("pi exited (call pi_ensure)".into());
     }
@@ -235,9 +249,9 @@ fn pi_send(cwd: String, payload: serde_json::Value, tag: Option<String>, state: 
 }
 
 #[tauri::command]
-fn pi_stop(cwd: String, tag: Option<String>, state: State<AppState>) -> Result<(), String> {
+fn pi_stop(_cwd: String, tag: Option<String>, key: String, state: State<AppState>) -> Result<(), String> {
     let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
-    if let Some(p) = procs.remove(&proc_key(&tag, &cwd)) {
+    if let Some(p) = procs.remove(&proc_key(&tag, &key)) {
         if let Ok(mut c) = p.child.lock() {
             let _ = c.kill();
         }
@@ -561,7 +575,8 @@ fn hide_window(app: AppHandle, label: String) {
 /// Bring up the full sessions window for a cwd (used by quickbar's "Open").
 #[tauri::command]
 fn open_in_main(app: AppHandle, cwd: String, session_path: Option<String>, state: State<AppState>) -> Result<(), String> {
-    pi_ensure(cwd.clone(), None, None, app.clone(), state)?;
+    let key = session_path.clone().unwrap_or_else(|| cwd.clone());
+    pi_ensure(cwd.clone(), None, None, key, session_path.clone(), app.clone(), state)?;
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();

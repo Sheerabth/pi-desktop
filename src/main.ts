@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { awaitSession, config, ensure, onRecord, pi, sessions, setTag, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, stopChild, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -116,14 +116,24 @@ function esc(s: string): string {
 
 // ---- streaming ----
 
-function flushStream() {
-  if (streamDiv && streamBuf) {
+const normText = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+function flushStream(finalText?: string) {
+  if (!streamDiv) {
+    streamBuf = "";
+    return;
+  }
+  if (streamBuf && finalText && normText(streamBuf) === normText(finalText)) {
+    // Streamed preview matches the authoritative message: drop the preview,
+    // the full render below replaces it. Otherwise we'd show it twice.
+    streamDiv.remove();
+  } else if (streamBuf) {
     const n = el("div", "msg assistant", renderMd(streamBuf));
     streamDiv.replaceWith(n);
     wireCopy(n);
     n.scrollIntoView({ block: "end" });
   } else {
-    streamDiv?.remove();
+    streamDiv.remove();
   }
   streamDiv = null;
   streamBuf = "";
@@ -177,7 +187,7 @@ function route(rec: any) {
   }
   // Authoritative completed message (top-level per json.md).
   if (rec.type === "message_end" && rec.message) {
-    flushStream();
+    flushStream(rec.message.role === "assistant" ? textOf(rec.message.content) : undefined);
     if (rec.message.role === "system") return;
     // Remember ToolCall args so rows can show what ran.
     if (rec.message.role === "assistant" && Array.isArray(rec.message.content)) {
@@ -211,11 +221,12 @@ function route(rec: any) {
       return;
     }
     if (rec.message.role === "assistant" && !textOf(rec.message.content)) return;
-    // Guard: never render the exact same assistant text twice in a row
-    // (streaming prediction vs final can otherwise double up).
+    // Guard: never render the same assistant text twice in a row
+    // (streaming prediction vs final, or repeated turns, can double up).
+    // Normalized: a trailing newline must not defeat it.
     if (rec.message.role === "assistant") {
-      const ft = textOf(rec.message.content);
-      if (ft && ft === lastFinalText) return;
+      const ft = normText(textOf(rec.message.content));
+      if (ft && ft === normText(lastFinalText)) return;
       if (ft) lastFinalText = ft;
     }
     const n = msgNode(rec.message, liveCalls);
@@ -342,13 +353,15 @@ async function refreshSessions() {
         alert(`delete failed: ${e.message ?? e}`);
         return;
       }
-      // Deleting the active session would leave pi holding a ghost:
-      // move to a fresh session first.
+      // Deleting the viewed session: stop its child (it keeps running
+      // otherwise, orphaned) and open a fresh one.
+      try {
+        await stopChild(cwd, s.path).catch(() => {});
+      } catch { /* no child */ }
       if (wasActive) {
         try {
-          await settleFirst();
-          await pi.newSession(cwd);
-          await awaitSession(cwd, s.path);
+          resetRunState();
+          await openFresh();
         } catch { /* fall through to refresh */ }
         refreshAll(false);
         return;
@@ -430,9 +443,11 @@ async function refreshMsgs() {
     }
     let shown = 0;
     let run: HTMLElement | null = null;
+    let prevAssistant = "";
     const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
     for (const m of arr) {
       if (m.role === "system") continue;
+      if (m.role === "user") prevAssistant = "";
       // One Activity container per user request: thoughts and tool rows
       // interleave chronologically. A new user message starts a new one.
       if (m.role === "user") run = null;
@@ -451,6 +466,13 @@ async function refreshMsgs() {
       // Textless assistant turns (tool-call-only) would flash as empty
       // boxes; their content already lives in the Activity container.
       if (m.role === "assistant" && !textOf(m.content)) continue;
+      // Consecutive near-identical assistant turns (retries/replays) render
+      // once. Normalized so trailing whitespace can't defeat it.
+      if (m.role === "assistant") {
+        const t = normText(textOf(m.content));
+        if (t && t === prevAssistant) continue;
+        if (t) prevAssistant = t;
+      }
       const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
       const n = msgNode(m, calls, fid);
       box.appendChild(n);
@@ -632,22 +654,28 @@ function refreshLight() {
   refreshState();
 }
 
-// Session surgery (new/switch/delete/revert/model) during an active run
-// streams the old run into the new session's view. Settle first.
-async function settleFirst() {
-  if (!streaming) return;
-  try {
-    await pi.abort(cwd);
-  } catch { /* ignore */ }
-}
+// Viewing another session must never disturb running ones: no aborts here.
+// Each session owns its pi child; switching only repoints this window at a
+// different child and re-renders. Local partial UI is reset so a stale
+// stream doesn't linger in the new view.
 
 async function doRevert(entryId: string) {
   try {
-    await settleFirst();
+    resetRunState();
     const before = curFile;
+    const oldKey = viewKey;
     const r: any = await pi.fork(cwd, entryId);
     if (r?.cancelled) return;
-    await awaitSession(cwd, before);
+    const file = await awaitSession(cwd, before);
+    // The fork switched this child; retire it and open a dedicated child
+    // so the key always means the file it names.
+    await stopChild(cwd, oldKey).catch(() => {});
+    if (file) {
+      await ensure(cwd, file, file);
+      setKey(file);
+      viewKey = file;
+      curFile = file;
+    }
     await refreshAll(false);
     if (r?.text) {
       const inp = $("input") as HTMLTextAreaElement;
@@ -661,16 +689,72 @@ async function doRevert(entryId: string) {
   }
 }
 
+// Local run state must die with the session: settled events arriving
+// across a switch gap otherwise leave streaming stuck (dead UI) or bleed
+// the old run into the new session's view.
+function resetRunState() {
+  streaming = false;
+  streamDiv?.remove();
+  streamDiv = null;
+  streamBuf = "";
+  liveRun = null;
+  liveThinkDiv = null;
+  liveThinkBuf = "";
+  lastFinalText = "";
+  pendingUser = "";
+  ($("send") as HTMLButtonElement).disabled = false;
+  ($("abortbtn") as HTMLButtonElement).disabled = true;
+  hideThinking();
+}
+
+// Viewing key: backend child this window currently talks to. For saved
+// sessions it is the session file; for unsaved ones a fresh id.
+let viewKey = "";
+let viewPath: string | null = null;
+
+// Fresh backend child for a brand-new session. The file only materializes
+// on first model activity; the poll pins the filename for the sidebar.
+async function openFresh(): Promise<void> {
+  const key = `fresh-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  await ensure(cwd, key, null);
+  setKey(key);
+  viewKey = key;
+  viewPath = null;
+  const before: string | null = await pi.state(cwd).then((s: any) => s?.sessionFile ?? null).catch(() => null);
+  await pi.newSession(cwd);
+  const file = await awaitSession(cwd, before);
+  curFile = file;
+  pendingNew = file ? { path: file, title: "New chat" } : null;
+}
+
 async function switchSession(path: string) {
   try {
-    await settleFirst();
-    await pi.switchSession(cwd, path);
-    await awaitSession(cwd, curFile, path);
+    resetRunState();
+    await ensure(cwd, path, path);
+    setKey(path);
+    viewKey = path;
+    viewPath = path;
+    curFile = path;
+    await syncRunFlag();
   } catch (e: any) {
     alert(`switch failed: ${e.message ?? e}`);
     return;
   }
   refreshAll(false);
+}
+
+// If the session we just opened is still running server-side, reflect it
+// locally so the composer locks and completion settles normally.
+async function syncRunFlag() {
+  try {
+    const s: any = await pi.state(cwd);
+    if (s?.isStreaming) {
+      streaming = true;
+      ($("send") as HTMLButtonElement).disabled = true;
+      ($("abortbtn") as HTMLButtonElement).disabled = false;
+      showThinking();
+    }
+  } catch { /* ignore */ }
 }
 
 async function send() {
@@ -698,6 +782,14 @@ async function send() {
     $("msgs").scrollTop = $("msgs").scrollHeight;
   }
   startRun();
+  try {
+    await ensure(cwd, viewKey || undefined, viewPath);
+    if (viewKey) setKey(viewKey);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start: ${e.message ?? e}`)));
+    finishRun();
+    return;
+  }
   // Register the about-to-be-written session immediately.
   pi.state(cwd).then((s: any) => {
     if (s?.sessionFile) {
@@ -738,12 +830,27 @@ let cwdGen = 0;
 async function setCwd(next: string, save = true) {
   const gen = ++cwdGen;
   cwd = next;
+  resetRunState();
   $("dirlabel").textContent = baseName(cwd) || cwd;
   ($("dirbtn") as HTMLButtonElement).title = cwd;
   syncDirMenu();
   unsub?.();
   try {
-    await ensure(cwd);
+    const files = await sessions.list(cwd).catch(() => []);
+    if (gen !== cwdGen) return;
+    if (files.length) {
+      // Continue the most recent session in its own child.
+      const f = files[0].path;
+      await ensure(cwd, f, f);
+      if (gen !== cwdGen) return;
+      setKey(f);
+      viewKey = f;
+      viewPath = f;
+      curFile = f;
+    } else {
+      await openFresh();
+      if (gen !== cwdGen) return;
+    }
   } catch (e: any) {
     $("msgs").innerHTML = "";
     $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start in ${cwd}: ${e.message ?? e}. Is pi on PATH?`)));
@@ -760,6 +867,7 @@ async function setCwd(next: string, save = true) {
     syncDirMenu();
   }
   refreshAll(true);
+  await syncRunFlag();
 }
 
 // Directory menu: recents + visible type-to-use field + browse. Same
@@ -836,11 +944,16 @@ async function openSettings() {
     const b = (e.target as HTMLElement).closest?.(".act-copy") as HTMLButtonElement | null;
     if (!b) return;
     const msg = b.closest(".msg");
-    const text = msg?.textContent?.replace(/copy$/, "").trim() ?? "";
+    const text = msg?.textContent?.trim() ?? "";
+    const orig = b.innerHTML;
     try {
       await navigator.clipboard.writeText(text);
-      b.textContent = "copied";
-      setTimeout(() => (b.textContent = "copy"), 1200);
+      b.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      b.title = "Copied";
+      setTimeout(() => {
+        b.innerHTML = orig;
+        b.title = "Copy";
+      }, 1200);
     } catch { /* ignore */ }
   });
 
@@ -867,9 +980,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("newsess") as HTMLButtonElement).addEventListener("click", async () => {
-    await settleFirst();
-    await pi.newSession(cwd);
-    await awaitSession(cwd, curFile);
+    resetRunState();
+    try {
+      await openFresh();
+    } catch (e: any) {
+      alert(`new chat failed: ${e.message ?? e}`);
+      return;
+    }
     refreshAll(false);
   });
   ($("searchbtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -1046,10 +1163,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   // Quickbar "open in sessions" handoff.
-  listen("open-request", (e: any) => {
+  listen("open-request", async (e: any) => {
     const p = e.payload ?? {};
-    if (p.cwd) setCwd(p.cwd);
-    if (p.sessionPath) switchSession(p.sessionPath);
+    if (p.cwd && p.cwd !== cwd) await setCwd(p.cwd);
+    if (p.sessionPath) await switchSession(p.sessionPath);
   }).catch(() => {});
 
   const c = await config.get();
