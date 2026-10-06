@@ -487,7 +487,7 @@ fn apply_tray(app: &AppHandle, enabled: bool) {
             .ok();
         let mut b = TrayIconBuilder::with_id("main-tray")
             .tooltip("Pi Desktop")
-            .menu_on_left_click(false)
+            .show_menu_on_left_click(false)
             .on_menu_event(|app, e| match e.id().as_ref() {
                 "show" => toggle_window(app, "main"),
                 "quit" => quit_app(app),
