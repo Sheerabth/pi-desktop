@@ -10,7 +10,7 @@ No Electron: Tauri 2 + system WebView. Frontend is dependency-free vanilla TS.
 Requires `pi` on `PATH` (override with `PI_BIN=/path/to/pi`).
 
 ```bash
-cd ~/Projects/pi-quickbar
+cd ~/Projects/pi-desktop
 npm run tauri dev
 ```
 
