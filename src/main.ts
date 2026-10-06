@@ -129,15 +129,29 @@ function flushStream() {
   streamBuf = "";
 }
 
+// Thinking indicator lives in the message flow, where the answer will
+// stream — never parked in a separate row above the composer.
+function showThinking() {
+  hideThinking();
+  const d = el("div", "msg thinking-row", THINKING_DOTS);
+  d.id = "runstatus";
+  $("msgs").appendChild(d);
+  d.scrollIntoView({ block: "end" });
+}
+function hideThinking() {
+  $("runstatus")?.remove();
+}
+
 function route(rec: any) {
   if (!rec) return;
-  const st = $("status");
   // Streaming deltas (wire records are delta-only).
   if (rec.type === "message_update") {
     const ev = rec.assistantMessageEvent ?? {};
     if (ev.type === "text_delta" && typeof ev.delta === "string") {
       // Dots stay until the final answer (agent_settled), even while text
       // streams or tools run in gaps. No flicker clearing anywhere else.
+      // First token takes the indicator's place in the flow.
+      if (streamBuf === "") hideThinking();
       streamBuf += ev.delta;
       if (!streamDiv) {
         streamDiv = el("div", "msg assistant stream");
@@ -146,7 +160,7 @@ function route(rec: any) {
       streamDiv.innerHTML = renderMd(streamBuf);
       streamDiv.scrollIntoView({ block: "end" });
     } else if (ev.type === "toolcall_start") {
-      st.innerHTML = THINKING_DOTS;
+      showThinking();
     } else if (typeof ev.type === "string" && ev.type.includes("think")) {
       const d = (ev as any).delta ?? (ev as any).text ?? "";
       if (typeof d === "string" && d) {
@@ -210,9 +224,8 @@ function route(rec: any) {
     n.scrollIntoView({ block: "end" });
     return;
   }
-  // No bottom flash: rows live in the tool group. Dots = working.
   if (rec.type === "tool_execution_start") {
-    st.innerHTML = THINKING_DOTS;
+    showThinking();
     return;
   }
   if (rec.type === "tool_execution_end") {
@@ -232,7 +245,7 @@ function startRun() {
   streamBuf = "";
   ($("send") as HTMLButtonElement).disabled = true;
   ($("abortbtn") as HTMLButtonElement).disabled = false;
-  $("status").innerHTML = THINKING_DOTS;
+  showThinking();
 }
 
 const autoNamed = new Set<string>();
@@ -264,11 +277,16 @@ function finishRun() {
   streamBuf = "";
   ($("send") as HTMLButtonElement).disabled = false;
   ($("abortbtn") as HTMLButtonElement).disabled = true;
-  $("status").textContent = "";
-  maybeAutoName().finally(() => refreshAll(false));
+  hideThinking();
+  maybeAutoName().finally(() => refreshLight());
 }
 
 // ---- data loading ----
+
+// Optimistic entry for the session being written: pi only materializes
+// the file on first model activity, but the user hit send *now*, so show
+// it now (keyed by the real session file from live state).
+let pendingNew: { path: string; title: string } | null = null;
 
 async function refreshSessions() {
   try {
@@ -277,22 +295,27 @@ async function refreshSessions() {
     sessCache = [];
     return;
   }
-  // Session files only materialize on first model activity, so a brand-new
-  // session is invisible to the disk scan. Source it from live pi state and
-  // show it immediately instead of waiting for the agent's first response.
-  try {
-    const s: any = await pi.state(cwd);
-    if (s?.sessionFile && !sessCache.some((x) => x.path === s.sessionFile)) {
-      sessCache.unshift({
-        path: s.sessionFile,
-        id: s.sessionId ?? "",
-        timestamp: new Date().toISOString(),
-        cwd,
-        name: s.sessionName ?? "New chat",
-        preview: null,
-      });
+  if (pendingNew) {
+    if (sessCache.some((x) => x.path === pendingNew!.path)) {
+      pendingNew = null; // file landed: real entry takes over
+    } else {
+      try {
+        const s: any = await pi.state(cwd);
+        if (s?.sessionFile === pendingNew.path) {
+          sessCache.unshift({
+            path: pendingNew.path,
+            id: s.sessionId ?? "",
+            timestamp: new Date().toISOString(),
+            cwd,
+            name: pendingNew.title,
+            preview: null,
+          });
+        } else {
+          pendingNew = null; // switched away: drop the ghost
+        }
+      } catch { /* pi starting */ }
     }
-  } catch { /* pi starting */ }
+  }
   const f = ($("sessfilter") as HTMLInputElement).value.toLowerCase();
   const list = $("sesslist");
   list.innerHTML = "";
@@ -602,6 +625,13 @@ function refreshAll(withModels: boolean) {
   else refreshState();
 }
 
+// Light refresh: sidebar + header only. The live stream already built the
+// transcript in place; rebuilding it here flashes the whole view.
+function refreshLight() {
+  refreshSessions();
+  refreshState();
+}
+
 // Session surgery (new/switch/delete/revert/model) during an active run
 // streams the old run into the new session's view. Settle first.
 async function settleFirst() {
@@ -668,6 +698,16 @@ async function send() {
     $("msgs").scrollTop = $("msgs").scrollHeight;
   }
   startRun();
+  // Register the about-to-be-written session immediately.
+  pi.state(cwd).then((s: any) => {
+    if (s?.sessionFile) {
+      pendingNew = {
+        path: s.sessionFile,
+        title: s.sessionName ?? text.split(/\s+/).slice(0, 6).join(" ").slice(0, 48) ?? "New chat",
+      };
+      refreshSessions();
+    }
+  }).catch(() => {});
   try {
     await pi.prompt(cwd, text);
     // completion arrives via agent_settled; safety net:

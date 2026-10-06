@@ -43,6 +43,11 @@
   --mono: "Source Code Pro", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
+/* Scrollbars stay out of the way: thin, transparent track, dim thumb. */
+* { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 4px; }
+*::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 16px; line-height: 1.6; }
 #app { display: flex; height: 100vh; }
 button { background: transparent; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; cursor: pointer; font-family: var(--sans); }
@@ -82,11 +87,9 @@ body.side-collapsed #side { display: none; }
 .dd-opt:hover .ddx { opacity: 1; }
 .ddx:hover { color: var(--text); }
 #dirtype { width: calc(100% - 8px); margin: 4px; font-size: 12px; }
-#modeltype { width: calc(100% - 8px); margin: 4px; font-size: 12px; }
-#modelopts { max-height: 280px; overflow-y: auto; }
-#thinktype { width: calc(100% - 8px); margin: 4px; font-size: 12px; }
-#thinkopts { max-height: 280px; overflow-y: auto; }
-#dirrecents { max-height: 240px; overflow-y: auto; }
+.dd-list { max-height: min(340px, 60vh); overflow-y: auto; }
+#modeltype, #thinktype, #dirtype { width: calc(100% - 8px); margin: 4px; font-size: 12px; position: sticky; top: 0; z-index: 2; background: var(--surface); }
+
 #dirlabel { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctools select:hover, .ctools input:hover { color: var(--text); background: #3a3a3a; }
 .ctools select:focus, .ctools input:focus { color: var(--text); }
@@ -166,7 +169,8 @@ details.toolrow > summary:hover { color: var(--text); }
 .toolerr { color: #e89b8b; }
 
 
-#status { min-height: 58px; padding: 16px 16px 14px; color: var(--dim); font-size: 12px; width: 100%; max-width: 1024px; margin: 0 auto; }
+#status { display: none; }
+.msg.thinking-row { padding: 4px 0; }
 .thinking { display: inline-flex; gap: 5px; padding: 6px 0; }
 .thinking i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); animation: tblink 1.2s infinite; }
 .thinking i:nth-child(2) { animation-delay: 0.2s; }
@@ -236,8 +240,8 @@ details.toolrow > summary:hover { color: var(--text); }
 .modalcard h3 { margin: 0; font-weight: 600; }
 .ver { font-size: 12px; font-weight: 400; color: var(--dim); }
 .modalcard label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--dim); }
-.modalcard label.checkrow { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
-.modalcard input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--text); }
+.modalcard label.checkrow { flex-direction: row; align-items: center; gap: 10px; color: var(--text); padding: 6px 0; cursor: pointer; }
+.modalcard input[type="checkbox"] { width: 16px; height: 16px; margin: 0; flex: none; accent-color: #fff; cursor: pointer; }
 .hint { font-size: 12px; color: var(--dim); }
 .hint code, .modalcard code { font-family: var(--mono); font-size: 11px; }
 .err { color: #e89b8b; font-size: 12px; }
