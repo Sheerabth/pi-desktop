@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pi</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="side">
+        <div class="side-top">
+          <span class="appmark" title="Pi">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
+          </span>
+          <button id="collapsebtn" class="iconbtn" title="Close sidebar">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="2" y="3" width="16" height="14" rx="2" stroke="currentColor" stroke-width="1.5"/><line x1="7" y1="3" x2="7" y2="17" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+        </div>
+        <div class="snav">
+          <button id="newsess" class="snavbtn" title="New chat">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M13.5 3.5l3 3L8 15H5v-3l8.5-8.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            <span>New chat</span>
+          </button>
+          <button id="searchbtn" class="snavbtn" title="Search chats">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.5"/><line x1="13.2" y1="13.2" x2="17" y2="17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            <span>Search chats</span>
+          </button>
+        </div>
+        <div class="slabel">Chats</div>
+        <input id="sessfilter" placeholder="Search chats…" />
+        <div id="sesslist"></div>
+        <div class="sidefoot">
+          <span class="avatar"></span>
+          <span class="who"><b>Pi</b><i>Go plan</i></span>
+          <button id="settingsbtn" class="upgradebtn" title="Settings">Settings</button>
+        </div>
+      </aside>
+      <main id="mainpane">
+        <header id="chathead">
+          <button id="expandbtn" class="iconbtn hidden" title="Open sidebar">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="2" y="3" width="16" height="14" rx="2" stroke="currentColor" stroke-width="1.5"/><line x1="7" y1="3" x2="7" y2="17" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+          <span id="sesstitle">—</span>
+        </header>
+        <div id="msgs"></div>
+        <button id="scrollbtn" class="iconbtn hidden" title="Scroll to bottom">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 3v12m0 0l-4.5-4.5M10 15l4.5-4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="status"></div>
+        <div id="composer">
+          <textarea id="input" rows="2" placeholder="Ask anything"></textarea>
+          <div class="cbtns">
+            <div class="ctools">
+              <div class="dd" id="modeldd">
+                <button class="dd-btn" id="modelbtn" title="Model"><span id="modellabel">model</span></button>
+                <div class="dd-list hidden" id="modellist"><input id="modeltype" spellcheck="false" placeholder="Search models…" /><div id="modelopts"></div></div>
+              </div>
+              <div class="dd" id="thinkdd">
+                <button class="dd-btn" id="thinkbtn" title="Thinking level"><span id="thinklabel"></span></button>
+                <div class="dd-list hidden" id="thinklist"><input id="thinktype" spellcheck="false" placeholder="Search levels…" /><div id="thinkopts"></div></div>
+              </div>
+              <div class="dd" id="dirdd">
+                <button class="dd-btn" id="dirbtn" title="Working directory"><span id="dirlabel">…</span></button>
+                <div class="dd-list hidden" id="dirlist">
+                  <input id="dirtype" spellcheck="false" placeholder="Type a path, Enter to use" />
+                  <div id="dirrecents"></div>
+                  <div class="dd-opt" id="dirbrowse">Browse…</div>
+                </div>
+              </div>
+            </div>
+            <span class="csp"></span>
+            <button id="abortbtn" disabled title="Stop"><svg width="14" height="14" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg></button>
+            <button id="send" title="Send">↑</button>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div id="settingsmodal" class="hidden">
+      <div class="modalcard">
+        <h3>Settings <span id="appver" class="ver"></span></h3>
+        <label>Quick-bar hotkey <input id="cfg-quick" spellcheck="false" /></label>
+        <label>Sessions hotkey <input id="cfg-main" spellcheck="false" /></label>
+        <label>Default dir <input id="cfg-dir" spellcheck="false" /></label>
+        <p class="hint">Format like <code>Super+J</code>, <code>Super+Shift+J</code>. In-app hotkeys may not fire on Wayland while another app is focused — add a KDE fallback: <br /><code>System Settings → Shortcuts → Custom → pi-desktop --toggle-quickbar</code></p>
+        <p id="cfgerr" class="err"></p>
+        <div class="modalbtns">
+          <button id="cfgsave">Save</button>
+          <button id="cfgclose">Close</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

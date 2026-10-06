@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pi</title>
+    <script type="module" src="/src/quickbar.ts" defer></script>
+  </head>
+  <body class="qb">
+    <div id="qbwrap">
+      <input id="qbinput" placeholder="Ask pi… (Enter send, Esc hide)" autocomplete="off" />
+      <div id="qbanswer" class="hidden"></div>
+      <div class="qbrow">
+        <span id="qbstatus"></span>
+        <span class="qbsp"></span>
+        <button id="qbcopier" class="hidden">copy</button>
+        <button id="qbopen" class="hidden">open in sessions</button>
+      </div>
+    </div>
+  </body>
+</html>
