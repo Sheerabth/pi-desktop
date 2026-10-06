@@ -236,6 +236,8 @@ details.toolrow > summary:hover { color: var(--text); }
 .modalcard h3 { margin: 0; font-weight: 600; }
 .ver { font-size: 12px; font-weight: 400; color: var(--dim); }
 .modalcard label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--dim); }
+.modalcard label.checkrow { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
+.modalcard input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--text); }
 .hint { font-size: 12px; color: var(--dim); }
 .hint code, .modalcard code { font-family: var(--mono); font-size: 11px; }
 .err { color: #e89b8b; font-size: 12px; }

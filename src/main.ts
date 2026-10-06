@@ -775,6 +775,7 @@ async function openSettings() {
   ($("cfg-quick") as HTMLInputElement).value = c.quickbar_hotkey;
   ($("cfg-main") as HTMLInputElement).value = c.main_hotkey;
   ($("cfg-dir") as HTMLInputElement).value = c.default_dir;
+  ($("cfg-bg") as HTMLInputElement).checked = c.run_in_bg !== false;
   $("cfgerr").textContent = "";
   $("settingsmodal").classList.remove("hidden");
 }
@@ -996,6 +997,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         quickbar_hotkey: ($("cfg-quick") as HTMLInputElement).value.trim(),
         main_hotkey: ($("cfg-main") as HTMLInputElement).value.trim(),
         default_dir: ($("cfg-dir") as HTMLInputElement).value.trim(),
+        run_in_bg: ($("cfg-bg") as HTMLInputElement).checked,
       });
       $("settingsmodal").classList.add("hidden");
     } catch (e: any) {

@@ -143,6 +143,7 @@ export interface AppConfig {
   default_dir: string;
   recents: string[];
   last_cwd: string;
+  run_in_bg?: boolean;
 }
 
 export const config = {

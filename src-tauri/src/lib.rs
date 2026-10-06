@@ -15,6 +15,10 @@ use tauri_plugin_global_shortcut::ShortcutState;
 
 // ---------------------------------------------------------------- config
 
+fn bg_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AppConfig {
     quickbar_hotkey: String,
@@ -22,6 +26,8 @@ struct AppConfig {
     default_dir: String,
     recents: Vec<String>,
     last_cwd: String,
+    #[serde(default = "bg_default")]
+    run_in_bg: bool,
 }
 
 impl Default for AppConfig {
@@ -36,6 +42,7 @@ impl Default for AppConfig {
             default_dir: qa.to_string_lossy().into_owned(),
             recents: vec![],
             last_cwd: qa.to_string_lossy().into_owned(),
+            run_in_bg: true,
         }
     }
 }
@@ -391,6 +398,14 @@ fn set_config(patch: serde_json::Value, app: AppHandle, state: State<AppState>) 
     if let Some(arr) = patch.get("recents").and_then(|v| v.as_array()) {
         cfg.recents = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
     }
+    if let Some(v) = patch.get("run_in_bg").and_then(|v| v.as_bool()) {
+        cfg.run_in_bg = v;
+        let snapshot = cfg.clone();
+        save_config(&snapshot);
+        drop(cfg);
+        apply_tray(&app, snapshot.run_in_bg);
+        return Ok(snapshot);
+    }
     if patch.get("quickbar_hotkey").or(patch.get("main_hotkey")).is_some() {
         let q = patch
             .get("quickbar_hotkey")
@@ -442,6 +457,66 @@ fn apply_hotkeys(app: &AppHandle, _state: &State<AppState>, cfg: &AppConfig) -> 
 }
 
 // ---------------------------------------------------------------- windows
+
+/// Kill every pi child, then exit. Otherwise quitting orphans them.
+fn quit_app(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut procs) = state.procs.lock() {
+            for (_, p) in procs.drain() {
+                if let Ok(mut c) = p.child.lock() {
+                    let _ = c.kill();
+                }
+            }
+        }
+    }
+    app.exit(0);
+}
+
+fn tray_icon_image() -> Option<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png")).ok()
+}
+
+/// Create the tray icon if missing; set visibility per background mode.
+fn apply_tray(app: &AppHandle, enabled: bool) {
+    use tauri::tray::TrayIconBuilder;
+    if app.tray_by_id("main-tray").is_none() {
+        let menu = tauri::menu::MenuBuilder::new(app)
+            .text("show", "Show Pi")
+            .text("quit", "Quit")
+            .build()
+            .ok();
+        let mut b = TrayIconBuilder::with_id("main-tray")
+            .tooltip("Pi Desktop")
+            .menu_on_left_click(false)
+            .on_menu_event(|app, e| match e.id().as_ref() {
+                "show" => toggle_window(app, "main"),
+                "quit" => quit_app(app),
+                _ => {}
+            })
+            .on_tray_icon_event(|tray, e| {
+                use tauri::tray::TrayIconEvent;
+                if let TrayIconEvent::Click { .. } = e {
+                    toggle_window(tray.app_handle(), "main");
+                }
+            });
+        if let Some(icon) = tray_icon_image() {
+            b = b.icon(icon);
+        }
+        if let Some(menu) = menu {
+            b = b.menu(&menu);
+        }
+        let _ = b.build(app);
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_visible(enabled);
+    }
+}
+
+fn bg_enabled(app: &AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .and_then(|s| s.config.lock().ok().map(|c| c.run_in_bg))
+        .unwrap_or(true)
+}
 
 fn toggle_window(app: &AppHandle, label: &str) {
     if let Some(w) = app.get_webview_window(label) {
@@ -557,15 +632,20 @@ pub fn run() {
             if let Err(e) = apply_hotkeys(&app.handle(), &app.state::<AppState>(), &cfg) {
                 eprintln!("hotkey registration failed: {e} (edit in Settings; KDE shortcut still works)");
             }
+            apply_tray(&app.handle(), cfg.run_in_bg);
             Ok(())
         })
         .on_window_event(|win, ev| {
-            // Hidden quickbar window keeps the process alive, so closing the
-            // sessions window must quit explicitly. Otherwise relaunches keep
-            // showing the stale version (single-instance forwards to us).
+            // Closing the sessions window quits outright, unless background
+            // mode is on — then it hides to the tray instead.
             if win.label() == "main" {
-                if let WindowEvent::CloseRequested { .. } = ev {
-                    win.app_handle().exit(0);
+                if let WindowEvent::CloseRequested { api, .. } = ev {
+                    if bg_enabled(win.app_handle()) {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    } else {
+                        quit_app(win.app_handle());
+                    }
                 }
             }
         })
