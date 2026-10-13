@@ -36,7 +36,9 @@ function esc(s: string): string {
 function inline(s: string): string {
   let h = esc(s);
   h = h.replace(/`([^`]+)`/g, "\u0001$1\u0002");
-  h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // Bold may contain single-asterisk italics: lazy span + trailing-star guard
+  // so `**a *b* c**` (italic-close + bold-close `***`) resolves correctly.
+  h = h.replace(/\*\*([\s\S]+?)\*\*(?!\*)/g, "<strong>$1</strong>");
   h = h.replace(/(^|[^*\w])\*([^\s*][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>");
   h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   // Bare URLs → links, but never inside code spans or existing anchors.

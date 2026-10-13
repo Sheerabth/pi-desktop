@@ -1,9 +1,9 @@
 // Quick-bar popup: Claude-style overlay. Enter sends to pi in last cwd,
 // streams inline, copy + open-in-sessions. Esc hides.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "./tauri-shim";
+import { listen } from "./tauri-shim";
+import { LogicalSize, getCurrentWindow } from "./tauri-window-shim";
 import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
 import { renderMd, wireCopy } from "./md";
 

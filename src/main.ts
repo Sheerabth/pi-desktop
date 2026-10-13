@@ -1,8 +1,8 @@
 // Sessions window: sidebar (dir + sessions), chat, model/thinking pickers,
 // settings (hotkeys). Thin view over pi RPC — pi owns everything.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./tauri-shim";
+import { listen } from "./tauri-shim";
 import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, stopChild, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
@@ -21,6 +21,341 @@ let streamBuf = "";
 let streamDiv: HTMLElement | null = null;
 let unsub: (() => void) | null = null;
 let sessCache: SessionInfo[] = [];
+
+// ---- ChatGPT chat dynamics ----
+let stick = true; // pinned to bottom unless the user scrolls up
+const ICO_STOP = `<svg width="14" height="14" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>`;
+const ICO_SEND = `↑`;
+function pin() {
+  if (!stick) return;
+  const m = $("scrollwrap");
+  m.scrollTop = m.scrollHeight;
+}
+// Single-button Send<->Stop morph, ChatGPT-style. The separate #abortbtn
+// is hidden (see styles.css); the composer button does both jobs.
+function syncSendBtn() {
+  const inp = document.getElementById("input") as HTMLTextAreaElement | null;
+  const btn = document.getElementById("send") as HTMLButtonElement | null;
+  if (!inp || !btn) return;
+  if (streaming) {
+    btn.disabled = false;
+    btn.dataset.mode = "stop";
+    btn.innerHTML = ICO_STOP;
+    btn.title = "Stop";
+  } else {
+    btn.dataset.mode = "send";
+    btn.innerHTML = ICO_SEND;
+    btn.title = "Send";
+    btn.disabled = !inp.value.trim();
+  }
+}
+// Fire-and-forget stop (button/Escape). Completion settles via agent_settled.
+function stopOnly() {
+  try {
+    pi.abort(cwd).catch(() => {});
+  } catch { /* ignore */ }
+}
+const ICO_COPY = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="6.5" y="6.5" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 6.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.5"/></svg>`;
+const ICO_REVERT = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3.5 8a6.5 6.5 0 1 1-1 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3.5 3.5V8H8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const ICO_SPEAK = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 7.5v5h2.5L10 16V4L5.5 7.5H3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M13 7.5a4 4 0 0 1 0 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+async function doCopy(btn: HTMLButtonElement) {
+  const msg = btn.closest(".msg");
+  const clone = msg?.cloneNode(true) as HTMLElement | null;
+  clone?.querySelector(".mmenu-wrap")?.remove();
+  const text = clone?.textContent?.trim() ?? "";
+  const isIcon = btn.classList.contains("act-copy");
+  const orig = btn.innerHTML;
+  try {
+    await navigator.clipboard.writeText(text);
+    if (isIcon) {
+      btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      btn.title = "Copied";
+      setTimeout(() => {
+        btn.innerHTML = orig;
+        btn.title = "Copy";
+      }, 1200);
+    }
+  } catch { /* ignore */ }
+}
+// ---- changes pane (Claude-style diff sidebar) ----
+type DiffRef = { tool: string; path: string; args: any; out: string };
+const diffFiles = new Map<string, DiffRef>(); // path -> latest edit/write, this view
+let selKey: string | null = null; // selected file in the pane list
+let viewRef: DiffRef | null = null; // pinned read, or selected file
+function diffKey(tool: string, path: string): string {
+  return path && path !== tool ? path : `${tool}:${path}`;
+}
+function trackDiff(ref: DiffRef) {
+  const k = diffKey(ref.tool, ref.path);
+  diffFiles.set(k, ref);
+  selKey = k;
+  viewRef = ref;
+}
+function collectEdits(arr: any[], calls: Map<string, any>) {
+  diffFiles.clear();
+  selKey = null;
+  viewRef = null;
+  for (const m of arr) {
+    if (m?.role !== "toolResult") continue;
+    const tn = (m.toolName ?? "").toLowerCase();
+    if (tn !== "edit" && tn !== "write") continue;
+    const a = calls.get(m.toolCallId);
+    const p = a?.arguments?.path ?? tn;
+    trackDiff({ tool: m.toolName, path: p, args: a?.arguments ?? {}, out: textOf(m.content) });
+  }
+}
+// Live tool result: edits/writes join the file list, reads pin view-only.
+function noteDiff(ref: DiffRef) {
+  const tn = (ref.tool || "").toLowerCase();
+  if (tn === "edit" || tn === "write") trackDiff(ref);
+  else {
+    viewRef = ref;
+    selKey = null;
+  }
+  if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+}
+function refCounts(r: DiffRef): string {
+  const t = (r.tool || "").toLowerCase();
+  if (t === "edit") return editCounts(r.args);
+  if (t === "write" && typeof r.args?.content === "string") return `+${r.args.content.split("\n").length}`;
+  return "";
+}
+// Code block with line numbers (reads in the Changes pane).
+function codeLines(src: string): HTMLElement {
+  const box = el("div", "codelines");
+  for (const ln of src.split("\n").slice(0, 400)) {
+    box.appendChild(el("div", "cl", esc(ln || " ")));
+  }
+  return box;
+}
+function renderDiffBody(ref: DiffRef): HTMLElement {
+  const t = (ref.tool || "").toLowerCase();
+  const content = typeof ref.args?.content === "string" ? ref.args.content : "";
+  // Markdown files read better rendered than as a green wall of raw text.
+  if (t === "write" && content && /\.(md|markdown|mdx)$/i.test(ref.path)) {
+    // Rendered documents need no card frame — text on pane background.
+    return el("div", "mdpreview", renderMd(content.slice(0, 12000)));
+  }
+  if (t === "edit" || t === "write") {
+    const d = editDiff(ref.tool, ref.args);
+    if (d) {
+      // Pane title already names the file; drop the duplicate inner header.
+      d.querySelector(":scope > .diffhead")?.remove();
+      return d;
+    }
+  }
+  if (t === "read") {
+    const wrap = el("div", "diffblock");
+    wrap.appendChild(el("div", "diffhead", `${esc(ref.path)} · read-only`));
+    const txt = ref.out.length > 6000 ? ref.out.slice(0, 6000) + "\n…(truncated)" : ref.out;
+    wrap.appendChild(codeLines(txt));
+    return wrap;
+  }
+  const wrap = el("div", "diffblock");
+  wrap.appendChild(el("div", "diffhead", esc(ref.path)));
+  wrap.appendChild(el("div", "tgout", renderMd(ref.out.slice(0, 4000))));
+  return wrap;
+}
+function renderDiffPane() {
+  const body = $("diffbody");
+  const title = $("difftitle");
+  body.innerHTML = "";
+  if (diffFiles.size) {
+    const list = el("div", "filelist");
+    for (const [k, r] of diffFiles) {
+      const base = r.path.split("/").pop() || r.path;
+      const o = el("button", "fileopt" + (k === selKey ? " cur" : ""),
+        `<span class="fname">${esc(base)}</span><span class="fcount">${esc(refCounts(r))}</span>`) as HTMLButtonElement;
+      o.title = r.path;
+      o.addEventListener("click", () => {
+        selKey = k;
+        viewRef = r;
+        renderDiffPane();
+      });
+      list.appendChild(o);
+    }
+    body.appendChild(list);
+  }
+  if (!viewRef) {
+    title.textContent = "Changes";
+    if (!diffFiles.size) body.appendChild(el("div", "msg sys", "No changes to show"));
+    return;
+  }
+  title.textContent = viewRef.path.split("/").pop() || viewRef.path;
+  body.appendChild(renderDiffBody(viewRef));
+  wireCopy(body);
+}
+// Single owner of pane visibility: hidden flag, wide-feed layout flag and
+// header-button state always move together, so they can't get stuck apart.
+function setDiffPane(open: boolean) {
+  $("diffpane").classList.toggle("hidden", !open);
+  ($("diffbtn") as HTMLButtonElement).classList.toggle("open", open);
+  if (open) renderDiffPane();
+}
+const toolElapsed = new Map<string, number>(); // toolCallId -> durationMs (server-reported)
+let runT0 = 0;
+let runTok = 0;
+let lastRun: HTMLElement | null = null;
+function fmtMs(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+function fmtTok(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+}
+// Claude-style one-line tool summary from name + args.
+function toolSummary(name: string, p: any): string {
+  const s = (v: any) => (typeof v === "string" ? v : "");
+  switch ((name || "").toLowerCase()) {
+    case "read": return p?.path ? `Read ${s(p.path)}` : "Read";
+    case "edit": {
+      const c = editCounts(p);
+      return p?.path ? `Edit ${s(p.path)}${c ? ` ${c}` : ""}` : "Edit";
+    }
+    case "write": {
+      const n = typeof p?.content === "string" ? p.content.split("\n").length : 0;
+      return p?.path ? `Write ${s(p.path)}${n ? ` (+${n})` : ""}` : "Write";
+    }
+    case "bash": return s(p?.command) ? `$ ${s(p.command).slice(0, 80)}` : "Bash";
+    case "glob": return s(p?.pattern) ? `Glob ${s(p.pattern)}` : "Glob";
+    case "grep": return s(p?.pattern) ? `Grep ${s(p.pattern)}` : "Grep";
+    default: {
+      const first = p && typeof p === "object" ? s(p.path || p.command || p.pattern || p.url || p.query) : "";
+      return first ? `${name} ${first.slice(0, 60)}` : name;
+    }
+  }
+}
+function editCounts(p: any): string {
+  try {
+    let add = 0, del = 0;
+    for (const e of p?.edits ?? []) {
+      add += String(e?.newText ?? "").split("\n").length;
+      del += String(e?.oldText ?? "").split("\n").length;
+    }
+    if (!add && !del) return "";
+    return `+${add} −${del}`;
+  } catch { return ""; }
+}
+// Unified diff block computed from edit/write args (the results carry no diff).
+function editDiff(name: string, p: any): HTMLElement | null {
+  try {
+    const n = (name || "").toLowerCase();
+    if (n === "edit" && Array.isArray(p?.edits) && p.edits.length) {
+      const wrap = el("div", "diffblock");
+      wrap.appendChild(el("div", "diffhead", esc(p.path ?? "edit")));
+      for (const e of p.edits.slice(0, 5)) {
+        wrap.appendChild(lineDiffBlock(String(e?.oldText ?? ""), String(e?.newText ?? "")));
+      }
+      return wrap;
+    }
+    if (n === "write" && typeof p?.content === "string") {
+      const wrap = el("div", "diffblock");
+      wrap.appendChild(el("div", "diffhead", esc(p.path ?? "write")));
+      wrap.appendChild(el("pre", "dl-add dlpad", esc(p.content.slice(0, 4000))));
+      return wrap;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+function lineDiffBlock(oldS: string, newS: string): HTMLElement {
+  const a = oldS.split("\n"), b = newS.split("\n");
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const box = el("div", "dlblock");
+  const line = (cls: string, sig: string, t: string) => {
+    box.appendChild(el("div", "dlline " + cls, `<span class="dlgutter">${sig}</span><code>${esc(t) || " "}</code>`));
+  };
+  a.slice(Math.max(0, pre - 2), pre).forEach((t) => line("dl-ctx", " ", t));
+  a.slice(pre, a.length - suf).forEach((t) => line("dl-del", "−", t));
+  b.slice(pre, b.length - suf).forEach((t) => line("dl-add", "+", t));
+  b.slice(b.length - suf, b.length - suf + 2).forEach((t) => line("dl-ctx", " ", t));
+  if (!a.length && !b.length) line("", " ", "(empty)");
+  return box;
+}
+
+// One toolbar per user turn, at the end of that turn's whole agent reply
+// (all interim texts + tool rows + final text share it). User bubbles keep
+// their own hover toolbar; these rows cover agent replies.
+function agentToolsRow(): HTMLElement {
+  return el("div", "turn-tools",
+    `<button class="act-tcopy iconbtn" title="Copy reply">${ICO_COPY}</button>` +
+    `<button class="act-tspeak iconbtn" title="Read aloud">${ICO_SPEAK}</button>`);
+}
+// All assistant-bubble texts of the turn containing `row` (oldest first).
+// The row lives inside the turn's last bubble; walk back to the user bubble.
+function turnText(row: HTMLElement): string {
+  const parts: string[] = [];
+  const nodes: HTMLElement[] = [];
+  let n: Element | null = row.closest(".msg.assistant");
+  while (n && !(n as HTMLElement).classList?.contains("umsgwrap")) {
+    nodes.unshift(n as HTMLElement);
+    n = n.previousElementSibling;
+  }
+  for (const el of nodes) {
+    if (el.classList.contains("msg") && el.classList.contains("assistant")) {
+      const c = el.cloneNode(true) as HTMLElement;
+      c.querySelector(".turn-tools")?.remove();
+      const t = c.textContent?.trim();
+      if (t) parts.push(t);
+    }
+  }
+  return parts.join("\n\n");
+}
+function copyTurn(btn: HTMLButtonElement) {
+  const row = btn.closest(".turn-tools") as HTMLElement | null;
+  if (!row) return;
+  navigator.clipboard.writeText(turnText(row)).catch(() => {});
+}
+let speakingTurn: HTMLElement | null = null;
+function speakTurn(btn: HTMLButtonElement) {
+  try {
+    const row = btn.closest(".turn-tools") as HTMLElement | null;
+    if (speakingTurn === btn || !row) {
+      speechSynthesis.cancel();
+      speakingTurn = null;
+      return;
+    }
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(turnText(row).slice(0, 2000));
+    u.onend = () => (speakingTurn = null);
+    speakingTurn = btn;
+    speechSynthesis.speak(u);
+  } catch { /* no TTS in this WebView */ }
+}
+function markTurnActions() {
+  document.querySelectorAll("#msgs > .turn-tools").forEach((n) => n.remove());
+  if (streaming) return;
+  const kids = Array.from(document.querySelectorAll("#msgs > *")) as HTMLElement[];
+  let hasAsst = false;
+  let lastIdx = -1;
+  let segStart = 0;
+  const flush = () => {
+    // Row goes inside the turn's last assistant bubble so it hover-reveals
+    // with that bubble (Claude-style: invisible at rest).
+    if (hasAsst) {
+      for (let i = lastIdx; i >= segStart; i--) {
+        const k = kids[i];
+        if (k.classList?.contains("msg") && k.classList.contains("assistant") && !k.classList.contains("stream")) {
+          k.appendChild(agentToolsRow());
+          break;
+        }
+      }
+    }
+    hasAsst = false;
+    lastIdx = -1;
+  };
+  kids.forEach((k, i) => {
+    if (k.classList.contains("umsgwrap")) {
+      flush();
+      segStart = i + 1;
+      return;
+    }
+    lastIdx = i;
+    if (k.classList.contains("msg") && k.classList.contains("assistant")) hasAsst = true;
+  });
+  flush();
+}
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -51,7 +386,8 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     box.appendChild(el("div", "ubody", renderMd(textOf(m.content) || "(empty)")));
     const wrap = el("div", "umsgwrap");
     wrap.appendChild(box);
-    // Overlay: no layout space, so the bubble hugs the text at 36px tall.
+    // Hover toolbar, icon-only and hidden at rest (Claude-style): copy +
+    // revert. Overlay takes no layout space so the bubble hugs the text.
     const acts = el(
       "div",
       "actions overlay",
@@ -75,8 +411,9 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
       const body = el("div", "atext", renderMd(text));
       box.appendChild(body);
     }
-    // Hover copy, same as user messages. Revert lives on user msgs only.
-    box.appendChild(el("div", "actions overlay", `<button class="act-copy iconbtn" title="Copy">${ICO_COPY}</button>`));
+    // No toolbar here: markFinalActions() puts one only under the final
+    // agent message. Revert lives on user messages (pi forks at the user
+    // turn; Claude's Rewind equivalent).
     // Model already lives in the composer chip; stop reasons like toolUse are
     // routine. Surface only real problems.
     if (m.stopReason === "error" || m.stopReason === "aborted")
@@ -88,18 +425,30 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
   // to the ToolCall block (name + arguments) from the assistant turn.
   if (role === "toolResult") {
     const args = calls?.get(m.toolCallId);
-    const ran = args?.arguments ? esc(JSON.stringify(args.arguments)).slice(0, 500) : "";
-    const out = textOf(m.content).slice(0, 2000);
+    const params = args?.arguments ?? {};
+    const ok = !m.isError;
+    const elapsed = toolElapsed.get(m.toolCallId ?? "");
     const d = el("details", "toolrow");
-    d.appendChild(el("summary", "tgsum", `\u2699 ${esc(m.toolName ?? "tool")}${m.isError ? ' <span class="toolerr">(error)</span>' : ""}`));
-    if (ran) d.appendChild(el("div", "tgrun", `<code>${ran}</code>`));
-    if (out) d.appendChild(el("div", "tgout", renderMd(out)));
+    d.appendChild(el("summary", "tgsum",
+      `<span class="tstat ${ok ? "ok" : "err"}">${ok ? "✓" : "✗"}</span> ` +
+      esc(toolSummary(m.toolName ?? "tool", params)) +
+      (elapsed != null ? ` <span class="telapsed">· ${fmtMs(elapsed)}</span>` : "")));
+    const diff = editDiff(m.toolName ?? "", params);
+    if (diff) {
+      d.appendChild(diff);
+    } else {
+      const ran = args?.arguments ? esc(JSON.stringify(args.arguments)).slice(0, 500) : "";
+      const out = textOf(m.content).slice(0, 2000);
+      if (ran) d.appendChild(el("div", "tgrun", `<code>${ran}</code>`));
+      if (out) d.appendChild(el("div", "tgout", renderMd(out)));
+    }
+    (d as any)._diff = { tool: m.toolName ?? "tool", path: params.path ?? (m.toolName ?? "tool"), args: params, out: textOf(m.content) };
     wireCopy(d);
     return d;
   }
   if (role === "bashExecution") {
     const d = el("details", "toolrow");
-    d.appendChild(el("summary", "tgsum", `\u2699 bash`));
+    d.appendChild(el("summary", "tgsum", `<span class="tstat ok">✓</span> $ ${esc((m.command ?? "bash").slice(0, 80))}`));
     d.appendChild(el("div", "tgrun", `<code>$ ${esc(m.command ?? "")}</code>`));
     if (m.output) d.appendChild(el("div", "tgout", `<pre><code>${esc(m.output.slice(0, 2000))}</code></pre>`));
     return d;
@@ -131,7 +480,7 @@ function flushStream(finalText?: string) {
     const n = el("div", "msg assistant", renderMd(streamBuf));
     streamDiv.replaceWith(n);
     wireCopy(n);
-    n.scrollIntoView({ block: "end" });
+    pin();
   } else {
     streamDiv.remove();
   }
@@ -146,7 +495,7 @@ function showThinking() {
   const d = el("div", "msg thinking-row", THINKING_DOTS);
   d.id = "runstatus";
   $("msgs").appendChild(d);
-  d.scrollIntoView({ block: "end" });
+  pin();
 }
 function hideThinking() {
   $("runstatus")?.remove();
@@ -156,6 +505,9 @@ function route(rec: any) {
   if (!rec) return;
   // Streaming deltas (wire records are delta-only).
   if (rec.type === "message_update") {
+    if (rec.usage && typeof rec.usage.totalTokens === "number") {
+      runTok = Math.max(runTok, rec.usage.totalTokens);
+    }
     const ev = rec.assistantMessageEvent ?? {};
     if (ev.type === "text_delta" && typeof ev.delta === "string") {
       // Dots stay until the final answer (agent_settled), even while text
@@ -168,7 +520,7 @@ function route(rec: any) {
         $("msgs").appendChild(streamDiv);
       }
       streamDiv.innerHTML = renderMd(streamBuf);
-      streamDiv.scrollIntoView({ block: "end" });
+      pin();
     } else if (ev.type === "toolcall_start") {
       showThinking();
     } else if (typeof ev.type === "string" && ev.type.includes("think")) {
@@ -217,7 +569,14 @@ function route(rec: any) {
     }
     if (rec.message.role === "toolResult" || rec.message.role === "bashExecution") {
       liveRun = runAppend($("msgs"), liveRun, msgNode(rec.message, liveCalls));
-      (liveRun as HTMLElement).scrollIntoView({ block: "end" });
+      pin();
+      if (rec.message.role === "toolResult") {
+        const tn = (rec.message.toolName ?? "").toLowerCase();
+        if (tn === "edit" || tn === "write" || tn === "read") {
+          const a = liveCalls.get(rec.message.toolCallId);
+          noteDiff({ tool: rec.message.toolName, path: a?.arguments?.path ?? tn, args: a?.arguments ?? {}, out: textOf(rec.message.content) });
+        }
+      }
       return;
     }
     if (rec.message.role === "assistant" && !textOf(rec.message.content)) return;
@@ -232,7 +591,8 @@ function route(rec: any) {
     const n = msgNode(rec.message, liveCalls);
     $("msgs").appendChild(n);
     wireCopy(n);
-    n.scrollIntoView({ block: "end" });
+    pin();
+    markTurnActions();
     return;
   }
   if (rec.type === "tool_execution_start") {
@@ -240,7 +600,9 @@ function route(rec: any) {
     return;
   }
   if (rec.type === "tool_execution_end") {
-    // Intentionally left showing: thinking runs till the final answer.
+    if (rec && typeof rec.toolCallId === "string" && typeof rec.durationMs === "number") {
+      toolElapsed.set(rec.toolCallId, rec.durationMs);
+    }
     return;
   }
   if (rec.type === "agent_settled") {
@@ -254,8 +616,10 @@ const THINKING_DOTS = `<span class="thinking" aria-label="thinking"><i></i><i></
 function startRun() {
   streaming = true;
   streamBuf = "";
-  ($("send") as HTMLButtonElement).disabled = true;
-  ($("abortbtn") as HTMLButtonElement).disabled = false;
+  markTurnActions();
+  runT0 = Date.now();
+  runTok = 0;
+  syncSendBtn();
   showThinking();
 }
 
@@ -286,9 +650,17 @@ function finishRun() {
   }
   streamDiv = null;
   streamBuf = "";
-  ($("send") as HTMLButtonElement).disabled = false;
-  ($("abortbtn") as HTMLButtonElement).disabled = true;
+  syncSendBtn();
   hideThinking();
+  markTurnActions();
+  if (lastRun && runT0 > 0) {
+    const sum = lastRun.querySelector(":scope > summary");
+    if (sum) {
+      const secs = ((Date.now() - runT0) / 1000).toFixed(1);
+      sum.innerHTML = `Activity · ${secs}s${runTok ? ` · ${fmtTok(runTok)} tokens` : ""} ${CHEV}`;
+    }
+    lastRun = null;
+  }
   maybeAutoName().finally(() => refreshLight());
 }
 
@@ -373,9 +745,6 @@ async function refreshSessions() {
   }
 }
 
-const ICO_COPY = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="6.5" y="6.5" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 6.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.5"/></svg>`;
-const ICO_REVERT = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3.5 8a6.5 6.5 0 1 1-1 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3.5 3.5V8H8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-
 // ChatGPT-style titles: explicit /name wins, else first words of first prompt.
 function titleText(s: SessionInfo): string {
   if (s.name) return s.name;
@@ -396,6 +765,7 @@ function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement)
   if (!run) {
     run = el("details", "runact");
     run.appendChild(el("summary", "tgsum", `Activity ${CHEV}`));
+    lastRun = run;
     run.appendChild(el("div", "tgbody"));
     box.appendChild(run);
   }
@@ -404,6 +774,7 @@ function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement)
 }
 
 function thoughtDiv(text: string): HTMLElement {
+  if (!text.trim()) return el("div", "runthought dim", "Thought");
   return el("div", "runthought", renderMd(text.slice(0, 4000)));
 }
 
@@ -478,12 +849,16 @@ async function refreshMsgs() {
       box.appendChild(n);
       shown++;
     }
+    collectEdits(arr, calls);
+    if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
     if (!shown) {
       const g = el("div", "greet", `<h2>Ready when you are.</h2>`);
       box.appendChild(g);
     }
     wireCopy(box);
-    box.scrollTop = box.scrollHeight;
+    markTurnActions();
+    const mp = $("scrollwrap");
+    mp.scrollTop = mp.scrollHeight;
   } catch (e: any) {
     box.appendChild(el("div", "msg sys", esc(`could not load messages: ${e.message ?? e}`)));
   }
@@ -503,6 +878,7 @@ async function refreshState() {
   } catch {
     /* pi may be starting */
   }
+  syncSendBtn();
 }
 
 function listActive(path?: string) {
@@ -702,8 +1078,12 @@ function resetRunState() {
   liveThinkBuf = "";
   lastFinalText = "";
   pendingUser = "";
-  ($("send") as HTMLButtonElement).disabled = false;
-  ($("abortbtn") as HTMLButtonElement).disabled = true;
+  lastRun = null;
+  diffFiles.clear();
+  selKey = null;
+  viewRef = null;
+  if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+  syncSendBtn();
   hideThinking();
 }
 
@@ -750,8 +1130,7 @@ async function syncRunFlag() {
     const s: any = await pi.state(cwd);
     if (s?.isStreaming) {
       streaming = true;
-      ($("send") as HTMLButtonElement).disabled = true;
-      ($("abortbtn") as HTMLButtonElement).disabled = false;
+      syncSendBtn();
       showThinking();
     }
   } catch { /* ignore */ }
@@ -760,8 +1139,14 @@ async function syncRunFlag() {
 async function send() {
   const inp = $("input") as HTMLTextAreaElement;
   const text = inp.value.trim();
-  if (!text || streaming) return;
+  if (!text || streaming) {
+    // ChatGPT: firing while streaming only stops; send again after.
+    if (streaming) stopOnly();
+    return;
+  }
+  stick = true;
   inp.value = "";
+  syncSendBtn();
   inp.style.height = "auto";
   liveRun = null;
   liveThinkDiv = null;
@@ -779,7 +1164,8 @@ async function send() {
     wrap.appendChild(box);
     wrap.appendChild(el("div", "actions overlay", `<button class="act-copy iconbtn" title="Copy">${ICO_COPY}</button>`));
     $("msgs").appendChild(wrap);
-    $("msgs").scrollTop = $("msgs").scrollHeight;
+    const mp2 = $("scrollwrap");
+    mp2.scrollTop = mp2.scrollHeight;
   }
   startRun();
   try {
@@ -930,10 +1316,9 @@ async function openSettings() {
 
 // ---- boot ----
 
-  // Hover action bars: copy message text (Claude-style, hover-only).
-  // Revert: fork the tree at that message, drop its text back in the
-  // composer for editing. Sending forks a branch (shows "No summary"
-  // in pi's tree view until pi summarizes the abandoned branch).
+  // Hover toolbars: copy message text, speak it, or revert (fork) at a user
+  // message. Sending after a revert forks a branch (shows "No summary" in
+  // pi's tree view until pi summarizes the abandoned branch).
   document.addEventListener("click", async (e) => {
     const rv = (e.target as HTMLElement).closest?.(".act-revert") as HTMLButtonElement | null;
     if (rv?.dataset.entry) {
@@ -941,25 +1326,29 @@ async function openSettings() {
       await doRevert(rv.dataset.entry);
       return;
     }
+    const tc = (e.target as HTMLElement).closest?.(".act-tcopy") as HTMLButtonElement | null;
+    if (tc) {
+      e.stopPropagation();
+      copyTurn(tc);
+      return;
+    }
+    const ts = (e.target as HTMLElement).closest?.(".act-tspeak") as HTMLButtonElement | null;
+    if (ts) {
+      e.stopPropagation();
+      speakTurn(ts);
+      return;
+    }
     const b = (e.target as HTMLElement).closest?.(".act-copy") as HTMLButtonElement | null;
     if (!b) return;
-    const msg = b.closest(".msg");
-    const text = msg?.textContent?.trim() ?? "";
-    const orig = b.innerHTML;
-    try {
-      await navigator.clipboard.writeText(text);
-      b.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-      b.title = "Copied";
-      setTimeout(() => {
-        b.innerHTML = orig;
-        b.title = "Copy";
-      }, 1200);
-    } catch { /* ignore */ }
+    doCopy(b);
   });
 
 window.addEventListener("DOMContentLoaded", async () => {
   setTag("main");
-  ($("send") as HTMLButtonElement).addEventListener("click", send);
+  ($("send") as HTMLButtonElement).addEventListener("click", () => {
+    if (streaming) stopOnly();
+    else send();
+  });
   ($("abortbtn") as HTMLButtonElement).addEventListener("click", async () => {
     try {
       await pi.abort(cwd);
@@ -970,7 +1359,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     inp.style.height = "auto";
     inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
   };
-  inp.addEventListener("input", autogrow);
+  inp.addEventListener("input", () => {
+    autogrow();
+    syncSendBtn();
+  });
   inp.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -1000,14 +1392,57 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.body.classList.remove("side-collapsed");
     ($("expandbtn") as HTMLButtonElement).classList.add("hidden");
   });
-  const msgs = $("msgs");
+  const scrollerEl = $("scrollwrap");
   const scroller = () => {
-    const away = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight;
+    const away = scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight;
+    stick = away < 80;
     ($("scrollbtn") as HTMLButtonElement).classList.toggle("hidden", away < 200);
   };
-  msgs.addEventListener("scroll", scroller);
+  scrollerEl.addEventListener("scroll", scroller);
+  ($("diffbtn") as HTMLButtonElement).addEventListener("click", () => {
+    setDiffPane($("diffpane").classList.contains("hidden"));
+  });
+  ($("diffclose") as HTMLButtonElement).addEventListener("click", () => {
+    setDiffPane(false);
+  });
+  const rp = $("diffpane");
+  const savedW = Number(localStorage.getItem("diffpane-w") || 0);
+  if (savedW >= 280 && savedW <= 900) rp.style.flexBasis = savedW + "px";
+  ($("diffresize") as HTMLElement).addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = rp.getBoundingClientRect().width;
+    const move = (ev: MouseEvent) => {
+      rp.style.flexBasis = Math.min(900, Math.max(280, startW + (startX - ev.clientX))) + "px";
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      localStorage.setItem("diffpane-w", String(Math.round(rp.getBoundingClientRect().width)));
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  });
+  // Expanding an edit/write/read row pins it to the Changes pane.
+  // (`toggle` doesn't bubble, so listen in capture phase.)
+  document.addEventListener("toggle", (e) => {
+    const d = e.target as HTMLElement;
+    if (d?.tagName === "DETAILS" && d.classList.contains("toolrow") && (d as HTMLDetailsElement).open) {
+      const ref = (d as any)._diff as DiffRef | undefined;
+      if (ref) {
+        noteDiff(ref);
+        const tn = (ref.tool || "").toLowerCase();
+        if (tn === "edit" || tn === "write") {
+          selKey = diffKey(ref.tool, ref.path);
+          viewRef = diffFiles.get(selKey) ?? ref;
+        }
+        setDiffPane(true);
+      }
+    }
+  }, true);
   ($("scrollbtn") as HTMLButtonElement).addEventListener("click", () => {
-    msgs.scrollTop = msgs.scrollHeight;
+    stick = true;
+    scrollerEl.scrollTop = scrollerEl.scrollHeight;
     ($("scrollbtn") as HTMLButtonElement).classList.add("hidden");
   });
   ($("sessfilter") as HTMLInputElement).addEventListener("input", refreshSessions);

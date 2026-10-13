@@ -1,8 +1,8 @@
 // Shared pi RPC client. KISS: one `pi-record` listener, id-correlated calls,
 // per-cwd streaming subscribers. No state duplicated from pi.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./tauri-shim";
+import { listen } from "./tauri-shim";
 
 // Namespace: main window and quickbar must NEVER share a pi child, even
 // for the same cwd. Otherwise one's newSession yanks the other's session

@@ -25,6 +25,10 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
+    proxy: {
+      // Browser mode (`npm run dev:web`): same-origin API to the pi bridge.
+      "/api": { target: "http://localhost:1423", changeOrigin: true },
+    },
     host: host || false,
     hmr: host
       ? {
