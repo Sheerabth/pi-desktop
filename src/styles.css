@@ -167,6 +167,9 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 .msg { font-size: 14px; }
 .msg.user { align-self: flex-end; max-width: min(75%, 640px); background: var(--bubble); border-radius: 24px; padding: 6px 16px; }
 .msg.user .ubody { line-height: 22px; }
+/* Pending follow-up: sent mid-turn, not yet taken in. Dimmed + dashed
+   until consume moves it below the in-progress response and locks it. */
+.umsgwrap.pending .msg.user { opacity: 0.65; border: 1px dashed var(--border); }
 .msg.assistant { align-self: stretch; position: relative; padding: 0; border: none; background: none; line-height: 24px; }
 .msg.sys { align-self: stretch; color: var(--dim); font-size: 13px; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 12px; background: none; }
 .msg.stream { opacity: 0.95; }
@@ -308,6 +311,10 @@ details.toolrow > summary:hover { color: var(--text); }
 figure.media { margin: 10px 0; max-width: 100%; }
 figure.media img { display: block; max-width: 100%; max-height: 420px; width: auto; height: auto; border-radius: 12px; border: 1px solid var(--border); cursor: zoom-in; background: #111; }
 figure.media img:hover { border-color: #6e6e6e; }
+/* Unresolved local image: the src-less img would render its alt text on
+   the img's #111 background (caption in a black box, doubled with the
+   real caption). Hide it — the figcaption alone marks the loading row. */
+figure.media.loading img { display: none; }
 /* Video starts as a click-to-play card (VIDEO_FACADE); the live player
    is only instantiated on click. */
 figure.media video { display: block; max-width: 100%; max-height: 420px; width: 100%; border-radius: 12px; border: 1px solid var(--border); background: #000; }
@@ -330,6 +337,17 @@ figure.media video { display: block; max-width: 100%; max-height: 420px; width: 
 .media-card.has-poster .media-play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; font-size: 16px; z-index: 1; }
 .media-card.has-poster .media-name, .media-card.has-poster .media-hint { position: relative; z-index: 1; color: #fff; }
 .media-card.has-poster .media-hint { color: rgba(255, 255, 255, 0.75); }
+/* Lightbox: click-to-inspect overlay for chat images. Fixed over the
+   whole window; Esc / backdrop / x closes. Capture-phase key handler
+   (see lightboxKeys) wins over composer/quickbar shortcuts. */
+.lightbox { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
+.lb-back { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.85); }
+.lb-fig { position: relative; margin: 0; max-width: 92vw; max-height: 88vh; display: flex; flex-direction: column; align-items: center; overflow: hidden; }
+.lb-fig img { max-width: 92vw; max-height: 82vh; object-fit: contain; border-radius: 8px; user-select: none; -webkit-user-drag: none; touch-action: none; }
+.lb-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--dim); max-width: 92vw; text-align: center; }
+.lb-bar { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 6px; background: rgba(30, 30, 30, 0.9); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; }
+.lb-btn { border: none; color: var(--text); font-size: 13px; padding: 4px 12px; border-radius: 999px; }
+.lb-btn:hover { background: rgba(255, 255, 255, 0.12); }
 figure.media figcaption { font-size: 12px; color: var(--dim); margin-top: 4px; }
 figure.media.broken { border: 1px dashed var(--border); border-radius: 12px; padding: 10px 12px; }
 .media-fallback { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--dim); }

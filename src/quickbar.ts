@@ -5,7 +5,7 @@ import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { LogicalSize, getCurrentWindow } from "./tauri-window-shim";
 import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
-import { renderMd, setMediaBase, wireCopy } from "./md";
+import { renderMd, setMediaBase, clearMediaCache, wireCopy } from "./md";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -178,6 +178,7 @@ function route(rec: any) {
 
 function done() {
   busy = false;
+  clearMediaCache();
   lastText = buf;
   setStatus(buf ? "" : "(empty)");
   if (buf) {

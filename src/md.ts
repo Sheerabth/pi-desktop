@@ -54,9 +54,19 @@ const IMAGE_EXTS = new Set([
 ]);
 const VIDEO_EXTS = new Set(["mp4", "webm", "mov", "ogv", "m4v"]);
 
+// Resolve-once media cache: one backend read per path per view, shared by
+// every token re-render. Positive hits are ALSO inlined synchronously at
+// render time (see mediaTag), so resolved images survive per-token
+// innerHTML wipes without flicker. Cleared on run end / view switch — a
+// regenerated file must re-read, never serve stale bytes.
+const mediaResolved = new Map<string, string>();
+const mediaKey = (abs: string): string => `${mediaBase}\n${abs}`;
+export function clearMediaCache(): void {
+  mediaResolved.clear();
+}
 // Base dir for resolving relative local paths (main.ts sets this on cwd
-// switch; without it relative paths resolve against nothing and just fail
-// gracefully to a caption + path fallback).
+// switch and session switch; without it relative paths fail gracefully to
+// a caption + path fallback).
 let mediaBase = "";
 export function setMediaBase(dir: string): void {
   mediaBase = dir;
@@ -148,9 +158,18 @@ function mediaTag(alt: string, src: string): string {
   // resolves. src is set only once real bytes arrive (see wireMedia).
   // Remote files load directly, src up front.
   if (isLocalSrc(safe)) {
+    // Sync fast-path: an already-resolved file inlines its bytes, so the
+    // image survives per-token stream re-renders with zero flicker.
+    const fast = mediaResolved.get(mediaKey(resolveLocal(src)));
+    if (fast) {
+      const cap = a ? `<figcaption>${a}</figcaption>` : "";
+      return `<figure class="media"><img loading="lazy" alt="${a}" src="${fast}">${cap}</figure>`;
+    }
+    // Unresolved: shimmer placeholder (CSS) until bytes land — never a
+    // premature failure verdict. wireMedia clears `loading` on settle.
     const cap = a ? `<figcaption>${a}</figcaption>` : "";
     return (
-      `<figure class="media"><img loading="lazy" alt="${a}" data-local="${u}">` +
+      `<figure class="media loading"><img loading="lazy" alt="${a}" data-local="${u}">` +
       `${cap}</figure>`
     );
   }
@@ -218,6 +237,7 @@ function wireVideoPosters(container: HTMLElement): void {
         img.remove();
         card.classList.remove("has-poster");
       });
+      img.addEventListener("load", mediaSettled, { once: true });
       img.src = url;
       thumb.appendChild(img);
       card.classList.add("has-poster");
@@ -243,10 +263,17 @@ function linkedMedia(alt: string, posterInner: string, targetInner: string): str
   const a = esc(alt);
   const t = esc(safeTarget);
   const p = esc(safePoster);
-  const img = isLocalSrc(safePoster)
-    ? `<img loading="lazy" alt="${a}" data-local="${p}">`
-    : `<img loading="lazy" referrerpolicy="no-referrer" src="${p}" alt="${a}">`;
-  return `<a href="${t}" target="_blank" rel="noreferrer"><figure class="media">${img}${a ? `<figcaption>${a}</figcaption>` : ""}</figure></a>`;
+  const localUnresolved =
+    isLocalSrc(safePoster) &&
+    !mediaResolved.has(mediaKey(resolveLocal(safePoster)));
+  const fcls = localUnresolved ? "media loading" : "media";
+  const img = (() => {
+    if (!isLocalSrc(safePoster)) return `<img loading="lazy" referrerpolicy="no-referrer" src="${p}" alt="${a}">`;
+    const fast = mediaResolved.get(mediaKey(resolveLocal(safePoster)));
+    if (fast) return `<img loading="lazy" src="${fast}" alt="${a}">`;
+    return `<img loading="lazy" alt="${a}" data-local="${p}">`;
+  })();
+  return `<a href="${t}" target="_blank" rel="noreferrer"><figure class="${fcls}">${img}${a ? `<figcaption>${a}</figcaption>` : ""}</figure></a>`;
 }
 
 // First whitespace-separated token of a `![alt](...)` inner, unbracketed
@@ -305,11 +332,15 @@ function sanitizeImg(tag: string): string | null {
   };
   const u = esc(safe);
   // No src up front for local files (see mediaTag: raw paths would error
-  // before bytes arrive). Remote keeps src for direct loading.
-  const srcAttr = isLocalSrc(safe)
-    ? ` data-local="${u}"`
-    : ` src="${u}"`;
-  return `<figure class="media"><img loading="lazy" referrerpolicy="no-referrer"${srcAttr} alt="${alt}"${dim("width")}${dim("height")}>${alt ? `<figcaption>${alt}</figcaption>` : ""}</figure>`;
+  // before bytes arrive) — unless already resolved (sync fast-path, no
+  // flicker on stream re-renders). Remote keeps src for direct loading.
+  const srcAttr = (() => {
+    if (!isLocalSrc(safe)) return { cls: "media", attr: ` src="${u}"` };
+    const fast = mediaResolved.get(mediaKey(resolveLocal(safe)));
+    if (fast) return { cls: "media", attr: ` src="${fast}"` };
+    return { cls: "media loading", attr: ` data-local="${u}"` };
+  })();
+  return `<figure class="${srcAttr.cls}"><img loading="lazy" referrerpolicy="no-referrer"${srcAttr.attr} alt="${alt}"${dim("width")}${dim("height")}>${alt ? `<figcaption>${alt}</figcaption>` : ""}</figure>`;
 }
 
 // Sanitize one raw <video ...>...</video> (or self-closing) tag into a
@@ -590,6 +621,114 @@ async function openExternal(url: string): Promise<void> {
 
 // Local videos open in the system player directly off disk (no asset-URL
 // round-trip: the external player couldn't reach our WebView's server).
+// Full-bleed lightbox: click any chat image to inspect it big. Wheel /
+// buttons zoom (0.5-5x), drag pans while zoomed, double-click toggles,
+// Esc / backdrop / x closes. External-open stays as a button inside.
+// One instance: opening replaces any existing overlay.
+function closeLightbox(): void {
+  document.querySelector(".lightbox")?.remove();
+  document.removeEventListener("keydown", lightboxKeys, true);
+}
+function lightboxKeys(e: KeyboardEvent): void {
+  if (e.key === "Escape") {
+    e.stopPropagation();
+    e.preventDefault();
+    closeLightbox();
+  }
+}
+export function openLightbox(src: string, alt: string): void {
+  closeLightbox();
+  const ov = document.createElement("div");
+  ov.className = "lightbox";
+  ov.tabIndex = -1;
+  const back = document.createElement("div");
+  back.className = "lb-back";
+  back.addEventListener("click", closeLightbox);
+  const fig = document.createElement("figure");
+  fig.className = "lb-fig";
+  const img = document.createElement("img");
+  img.alt = alt;
+  fig.appendChild(img);
+  if (alt) {
+    const cap = document.createElement("figcaption");
+    cap.textContent = alt;
+    fig.appendChild(cap);
+  }
+  const bar = document.createElement("div");
+  bar.className = "lb-bar";
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+  const apply = (): void => {
+    img.style.transform = "scale(" + scale + ") translate(" + tx / scale + "px, " + ty / scale + "px)";
+    img.style.cursor = scale > 1 ? "grab" : "zoom-in";
+  };
+  const zoomBy = (f: number): void => {
+    scale = Math.min(5, Math.max(0.5, scale * f));
+    if (scale === 1) {
+      tx = 0;
+      ty = 0;
+    }
+    apply();
+  };
+  const mk = (label: string, title: string, fn: () => void): HTMLButtonElement => {
+    const b = document.createElement("button");
+    b.className = "lb-btn";
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      fn();
+    });
+    return b;
+  };
+  bar.appendChild(mk("-", "Zoom out", () => zoomBy(1 / 1.25)));
+  bar.appendChild(mk("+", "Zoom in", () => zoomBy(1.25)));
+  bar.appendChild(mk("1:1", "Reset zoom", () => {
+    scale = 1;
+    tx = 0;
+    ty = 0;
+    apply();
+  }));
+  bar.appendChild(mk("open", "Open externally", () => openExternal(src).catch(() => {})));
+  bar.appendChild(mk("x", "Close", closeLightbox));
+  ov.appendChild(back);
+  ov.appendChild(fig);
+  ov.appendChild(bar);
+  // Wheel over the figure zooms (passive false: suppress page scroll).
+  fig.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, { passive: false });
+  img.addEventListener("dblclick", () => zoomBy(scale > 1.2 ? 1 / scale : 2.2));
+  // Pan while zoomed: drag the image itself.
+  let drag: { x: number; y: number } | null = null;
+  img.addEventListener("pointerdown", (e) => {
+    if (scale <= 1) return;
+    drag = { x: e.clientX - tx, y: e.clientY - ty };
+    try {
+      img.setPointerCapture(e.pointerId);
+    } catch { /* ignore */ }
+    img.style.cursor = "grabbing";
+  });
+  img.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    tx = e.clientX - drag.x;
+    ty = e.clientY - drag.y;
+    apply();
+  });
+  const endDrag = (): void => {
+    drag = null;
+    if (scale > 1) img.style.cursor = "grab";
+  };
+  img.addEventListener("pointerup", endDrag);
+  img.addEventListener("pointercancel", endDrag);
+  document.addEventListener("keydown", lightboxKeys, true);
+  document.body.appendChild(ov);
+  img.src = src;
+  apply();
+  ov.focus();
+}
 async function openLocalPath(abs: string, fallbackUrl: string): Promise<void> {
   try {
     const { openPath } = await import("@tauri-apps/plugin-opener");
@@ -603,13 +742,20 @@ async function openLocalPath(abs: string, fallbackUrl: string): Promise<void> {
 
 async function toAssetUrl(localPath: string): Promise<string | null> {
   // Local files ride over plain invoke as data: URIs (see read_media).
-  // Returns null when unreadable — caller shows the path fallback.
+  // Resolve-once: every token re-render shares one backend read.
+  const key = mediaKey(localPath);
+  const hit = mediaResolved.get(key);
+  if (hit) return hit;
   try {
     const r = await invoke<{ mime: string; base64: string }>("read_media", {
       path: localPath,
       base: mediaBase || null,
     });
-    if (r?.mime && r?.base64) return `data:${r.mime};base64,${r.base64}`;
+    if (r?.mime && r?.base64) {
+      const uri = `data:${r.mime};base64,${r.base64}`;
+      mediaResolved.set(key, uri);
+      return uri;
+    }
     return null;
   } catch {
     return null;
@@ -622,6 +768,7 @@ function mediaFallback(fig: HTMLElement, label: string): void {
   if (fig.dataset.fbk) return;
   fig.dataset.fbk = "1";
   fig.classList.add("broken");
+  fig.classList.remove("loading");
   const safe = esc(label.slice(0, 300));
   const isHttp = /^https?:\/\//i.test(label);
   fig.innerHTML =
@@ -632,7 +779,16 @@ function mediaFallback(fig: HTMLElement, label: string): void {
     `</div>`;
 }
 
+// Broadcast when any media settles (bytes in, poster on, player sized).
+// Followers (sessions window) re-pin only if the user never scrolled up.
+function mediaSettled(): void {
+  try {
+    window.dispatchEvent(new CustomEvent("pi-media-settled"));
+  } catch { /* ignore */ }
+}
+
 function wireMedia(container: HTMLElement): void {
+  // (Settle notifications go through module-level mediaSettled.)
   // Local files (-> data: URIs via read_media, Tauri or browser dev).
   // Each element resolves once.
   container
@@ -649,16 +805,28 @@ function wireMedia(container: HTMLElement): void {
       }
       const abs = resolveLocal(raw);
       // No src attribute yet (see mediaTag), so no premature error event.
-      // Only the read itself can fail us now.
-      toAssetUrl(abs).then((url) => {
-        if (!el.isConnected) return; // user navigated away mid-load
-        if (url) {
-          el.setAttribute("src", url);
-          el.removeAttribute("data-local");
-        } else if (fig) {
-          mediaFallback(fig, raw);
-        }
-      });
+      // Retry twice with backoff before the terminal verdict: a busy
+      // backend fails transiently, and the shimmer covers the wait.
+      const attempt = (): void => {
+        const tries = (((el as any)._tries ?? 0) + 1) as number;
+        (el as any)._tries = tries;
+        toAssetUrl(abs).then((url) => {
+          if (!el.isConnected) return;
+          if (url) {
+            fig?.classList.remove("loading");
+            el.setAttribute("src", url);
+            el.removeAttribute("data-local");
+            el.addEventListener("load", mediaSettled, { once: true });
+          } else if (tries < 3) {
+            setTimeout(() => {
+              if (el.isConnected && el.hasAttribute("data-local")) attempt();
+            }, 1000 * tries);
+          } else if (fig) {
+            mediaFallback(fig, raw);
+          }
+        });
+      };
+      attempt();
     });
   // Remote images: error fallback + click-to-open-full.
   container.querySelectorAll<HTMLImageElement>("figure.media > img").forEach((img) => {
@@ -668,9 +836,14 @@ function wireMedia(container: HTMLElement): void {
     img.addEventListener("error", () => {
       if (fig) mediaFallback(fig, img.getAttribute("src") ?? "image");
     });
+    // Remote images load natively (no read step): follow their completion
+    // too, otherwise late bytes strand the viewport mid-answer.
+    if (!img.currentSrc && img.getAttribute("src")) {
+      img.addEventListener("load", mediaSettled, { once: true });
+    }
     img.addEventListener("click", () => {
       const src = img.currentSrc || img.getAttribute("src") || "";
-      if (src) openExternal(src).catch(() => {});
+      if (src) openLightbox(src, img.getAttribute("alt") ?? "");
     });
   });
   // Video cards: click plays inline (pipeline starts on user gesture
@@ -721,6 +894,7 @@ function playVideoCard(b: HTMLButtonElement): void {
     v.preload = "metadata";
     (v as any).playsInline = true;
     v.src = playSrc;
+    v.addEventListener("loadedmetadata", mediaSettled, { once: true });
     v.addEventListener("error", () => mediaFallback(fig, open || caption));
     fig.appendChild(v);
     if (caption) {
