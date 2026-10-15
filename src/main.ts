@@ -119,13 +119,12 @@ function collectEdits(arr: any[], calls: Map<string, any>) {
   }
 }
 // Live tool result: edits/writes join the file list, reads pin view-only.
+// Reads never touch the pane: only file changes (edit/write) appear there.
+// Everything else expands inline in the transcript and leaves it alone.
 function noteDiff(ref: DiffRef) {
   const tn = (ref.tool || "").toLowerCase();
-  if (tn === "edit" || tn === "write") trackDiff(ref);
-  else {
-    viewRef = ref;
-    selKey = null;
-  }
+  if (tn !== "edit" && tn !== "write") return;
+  trackDiff(ref);
   if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
 }
 function refCounts(r: DiffRef): string {
@@ -261,10 +260,16 @@ function editDiff(name: string, p: any): HTMLElement | null {
       }
       return wrap;
     }
+    // A new file is a diff with an empty old side: same hunks, gutters
+    // and colors as edits, every line an addition. No separate look.
     if (n === "write" && typeof p?.content === "string") {
       const wrap = el("div", "diffblock");
       wrap.appendChild(el("div", "diffhead", esc(p.path ?? "write")));
-      wrap.appendChild(el("pre", "dl-add dlpad", esc(p.content.slice(0, 4000))));
+      const box = el("div", "dlblock");
+      for (const t of p.content.slice(0, 4000).split("\n").slice(0, 400)) {
+        box.appendChild(el("div", "dlline dl-add", `<span class="dlgutter">+</span><code>${esc(t) || " "}</code>`));
+      }
+      wrap.appendChild(box);
       return wrap;
     }
   } catch { /* fall through */ }
@@ -627,7 +632,9 @@ function route(rec: any) {
       pin();
       if (rec.message.role === "toolResult") {
         const tn = (rec.message.toolName ?? "").toLowerCase();
-        if (tn === "edit" || tn === "write" || tn === "read") {
+        // Pane tracks file changes only (edit/write). Reads, bash and
+        // friends expand inline and never touch it.
+        if (tn === "edit" || tn === "write") {
           const a = liveCalls.get(rec.message.toolCallId);
           noteDiff({ tool: rec.message.toolName, path: a?.arguments?.path ?? tn, args: a?.arguments ?? {}, out: textOf(rec.message.content) });
         }
@@ -1714,21 +1721,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
   });
-  // Expanding an edit/write/read row pins it to the Changes pane.
-  // (`toggle` doesn't bubble, so listen in capture phase.)
+  // Expanding an edit/write row tracks it in the Changes pane (lands
+  // there on manual open) — but never force-opens it. Reads, bash and
+  // friends expand inline only. (`toggle` doesn't bubble, so listen in
+  // capture phase.)
   document.addEventListener("toggle", (e) => {
     const d = e.target as HTMLElement;
     if (d?.tagName === "DETAILS" && d.classList.contains("toolrow") && (d as HTMLDetailsElement).open) {
       const ref = (d as any)._diff as DiffRef | undefined;
-      if (ref) {
-        noteDiff(ref);
-        const tn = (ref.tool || "").toLowerCase();
-        if (tn === "edit" || tn === "write") {
-          selKey = diffKey(ref.tool, ref.path);
-          viewRef = diffFiles.get(selKey) ?? ref;
-        }
-        setDiffPane(true);
-      }
+      const tn = (ref?.tool || "").toLowerCase();
+      if (!ref || (tn !== "edit" && tn !== "write")) return;
+      noteDiff(ref);
+      selKey = diffKey(ref.tool, ref.path);
+      viewRef = diffFiles.get(selKey) ?? ref;
+      if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
     }
   }, true);
   ($("scrollbtn") as HTMLButtonElement).addEventListener("click", () => {
