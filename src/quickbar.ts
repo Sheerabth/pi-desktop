@@ -5,7 +5,7 @@ import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { LogicalSize, getCurrentWindow } from "./tauri-window-shim";
 import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
-import { renderMd, wireCopy } from "./md";
+import { renderMd, setMediaBase, wireCopy } from "./md";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -33,6 +33,7 @@ async function boot() {
   setTag("quickbar");
   const c = await config.get().catch(() => null);
   cwd = c?.last_cwd || c?.default_dir || "";
+  setMediaBase(cwd);
   // Size follows content, always: observe instead of trusting call sites.
   // ResizeObserver fires per streamed token: debounce or the window
   // resizes dozens of times per answer.

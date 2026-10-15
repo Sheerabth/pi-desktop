@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
+use base64::Engine as _;
 
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -383,6 +384,59 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
     Ok(out)
 }
 
+/// Read a media file for inline display. Returns `{"mime", "base64"}`.
+/// Relative paths resolve against `base` (the viewed session's cwd).
+/// Absolute paths are used as-is. Cap 12MB: screenshots are KBs; anything
+/// bigger stays a click-to-open card handled frontend-side.
+///
+/// Why bytes-over-IPC instead of convertFileSrc/asset URLs: this box's
+/// WebKitGTK fails Tauri custom-scheme loads entirely (asset: *and* the
+/// IPC scheme fall back with "Load failed" once assetProtocol is
+/// touched), while plain invoke round-trips fine. Data URIs use no
+/// custom scheme at all.
+#[tauri::command]
+fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
+    let p = if let Some(rest) = path.strip_prefix("~/") {
+        // Frontend can't expand ~ (it doesn't know HOME); backend can.
+        match dirs::home_dir() {
+            Some(h) => h.join(rest),
+            None => return Err("cannot resolve ~ (no home dir)".into()),
+        }
+    } else if std::path::Path::new(&path).is_absolute() {
+        PathBuf::from(&path)
+    } else if let Some(b) = base.filter(|b| !b.is_empty()) {
+        PathBuf::from(b).join(&path)
+    } else {
+        return Err("relative media path with no base dir".into());
+    };
+    // file:// prefix from markdown ("file:///x/y.png" -> "/x/y.png").
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix("file://").unwrap_or(&s);
+    let p = PathBuf::from(s);
+    let meta = fs::metadata(&p).map_err(|e| format!("unreadable media file: {e}"))?;
+    if meta.len() > 12 * 1024 * 1024 {
+        return Err("media file too large for inline display (>12MB)".into());
+    }
+    let bytes = fs::read(&p).map_err(|e| format!("unreadable media file: {e}"))?;
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
+        _ => return Err(format!("unsupported media type: .{ext}")),
+    };
+    Ok(serde_json::json!({ "mime": mime, "base64": base64::engine::general_purpose::STANDARD.encode(&bytes) }))
+}
+
 #[tauri::command]
 fn delete_session(path: String, session_root: Option<String>) -> Result<(), String> {
     let root = session_root.unwrap_or_else(session_root_default);
@@ -670,6 +724,7 @@ pub fn run() {
             pi_stop,
             list_sessions,
             delete_session,
+            read_media,
             get_config,
             set_config,
             toggle_quickbar,

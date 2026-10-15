@@ -7,7 +7,7 @@ import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, s
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
-import { renderMd, wireCopy } from "./md";
+import { renderMd, setMediaBase, wireCopy } from "./md";
 
 let cwd = "";
 let liveRun: HTMLElement | null = null;
@@ -324,7 +324,11 @@ function speakTurn(btn: HTMLButtonElement) {
   } catch { /* no TTS in this WebView */ }
 }
 function markTurnActions() {
-  document.querySelectorAll("#msgs > .turn-tools").forEach((n) => n.remove());
+  // Rows live INSIDE the turn's last assistant bubble (not as direct
+  // #msgs children), so cleanup must be a descendant selector — the old
+  // `#msgs > .turn-tools` never matched and rows duplicated on every
+  // message_end/finish/refresh. One row per user turn, rebuilt each call.
+  document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
   if (streaming) return;
   const kids = Array.from(document.querySelectorAll("#msgs > *")) as HTMLElement[];
   let hasAsst = false;
@@ -592,6 +596,14 @@ function route(rec: any) {
     $("msgs").appendChild(n);
     wireCopy(n);
     pin();
+    // Live text splits the Activity stream like history does: later
+    // thoughts/tools start a new container below this bubble. Clear the
+    // partial-think pointer too, or new deltas bleed into the old box.
+    if (rec.message.role === "assistant") {
+      liveRun = null;
+      liveThinkDiv = null;
+      liveThinkBuf = "";
+    }
     markTurnActions();
     return;
   }
@@ -638,6 +650,35 @@ async function maybeAutoName() {
     autoNamed.add(s.sessionFile);
     await pi.setName(cwd, text);
   } catch { /* best effort */ }
+}
+
+// Truth-based run watchdog: while the UI believes a run is live, poll the
+// agent's own isStreaming flag. Settles the UI when the agent is actually
+// done (normal path is still agent_settled; this covers lost events and
+// dead children). Never settles while the agent reports work in progress,
+// no matter how long the run takes. 30min cap so a wedged poller dies.
+function watchRun(watchCwd: string): void {
+  let n = 0;
+  const t = setInterval(async () => {
+    if (!streaming || watchCwd !== cwd) {
+      clearInterval(t);
+      return;
+    }
+    if (++n > 120) {
+      finishRun();
+      clearInterval(t);
+      return;
+    }
+    try {
+      const s: any = await pi.state(watchCwd);
+      if (s && s.isStreaming === false) {
+        finishRun();
+        clearInterval(t);
+      }
+    } catch {
+      /* pi busy/starting: keep watching */
+    }
+  }, 15_000);
 }
 
 function finishRun() {
@@ -847,6 +888,11 @@ async function refreshMsgs() {
       const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
       const n = msgNode(m, calls, fid);
       box.appendChild(n);
+      // Rendered text splits the Activity stream: thoughts/tools after
+      // this bubble belong to a NEW container below it, not clumped
+      // into the one above. (User messages already reset; textless
+      // assistant turns continued out earlier.)
+      if (m.role === "assistant") run = null;
       shown++;
     }
     collectEdits(arr, calls);
@@ -1108,6 +1154,10 @@ async function openFresh(): Promise<void> {
 }
 
 async function switchSession(path: string) {
+  // Relative embeds (./shots/…) resolve against the viewed session's own
+  // cwd, which may differ from the window cwd after cross-dir navigation.
+  const info = sessCache.find((x) => x.path === path);
+  if (info?.cwd) setMediaBase(info.cwd);
   try {
     resetRunState();
     await ensure(cwd, path, path);
@@ -1188,10 +1238,11 @@ async function send() {
   }).catch(() => {});
   try {
     await pi.prompt(cwd, text);
-    // completion arrives via agent_settled; safety net:
-    setTimeout(() => {
-      if (streaming) finishRun();
-    }, 180_000);
+    // Completion arrives via agent_settled. Watchdog (not a fixed timer):
+    // the old 180s safety net declared the run finished while long agents
+    // were still working. Now we poll the agent's own isStreaming flag and
+    // only settle the UI when it is actually done (or lost, or 30min cap).
+    watchRun(cwd);
   } catch (e: any) {
     $("msgs").appendChild(el("div", "msg sys", esc(`send failed: ${e.message ?? e}`)));
     finishRun();
@@ -1216,6 +1267,7 @@ let cwdGen = 0;
 async function setCwd(next: string, save = true) {
   const gen = ++cwdGen;
   cwd = next;
+  setMediaBase(next);
   resetRunState();
   $("dirlabel").textContent = baseName(cwd) || cwd;
   ($("dirbtn") as HTMLButtonElement).title = cwd;

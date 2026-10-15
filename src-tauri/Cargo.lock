@@ -2552,6 +2552,7 @@ dependencies = [
 name = "pi-desktop"
 version = "0.1.26"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "serde",
  "serde_json",

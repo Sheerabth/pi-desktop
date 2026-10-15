@@ -254,7 +254,32 @@ function listSessions(cwdFilter, sessionRoot) {
 
 // ---------------------------------------------------------------- commands
 
+const MEDIA_MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+  svg: "image/svg+xml", ico: "image/x-icon", avif: "image/avif",
+  mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm",
+  mov: "video/quicktime", ogv: "video/ogg",
+};
+
+function readMedia(mediaPath, base) {
+  let p = mediaPath;
+  if (p.startsWith("~/")) p = path.join(HOME, p.slice(2));
+  else if (p.startsWith("file://")) p = decodeURI(p.replace(/^file:\/\//, ""));
+  else if (!path.isAbsolute(p)) {
+    if (!base) throw new Error("relative media path with no base dir");
+    p = path.join(base, p);
+  }
+  const st = fs.statSync(p);
+  if (st.size > 12 * 1024 * 1024) throw new Error("media file too large for inline display (>12MB)");
+  const ext = (path.extname(p).slice(1) || "").toLowerCase();
+  const mime = MEDIA_MIME[ext];
+  if (!mime) throw new Error(`unsupported media type: .${ext}`);
+  return { mime, base64: fs.readFileSync(p).toString("base64") };
+}
+
 const handlers = {
+  read_media: (p) => readMedia(p.path, p.base ?? null),
   pi_ensure: (p) => ensureProc(p),
   pi_send: (p) => (sendProc(p), null),
   pi_stop: (p) => (stopProc(p), null),
