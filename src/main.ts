@@ -11,12 +11,8 @@ import { renderMd, setMediaBase, clearMediaCache, wireCopy } from "./md";
 
 let cwd = "";
 let liveRun: HTMLElement | null = null;
-let pendingUser = new Set<string>();
 let liveThinkDiv: HTMLElement | null = null;
 let liveThinkBuf = "";
-// Last assistant text per viewed session key (never global: identical
-// closers like "Done." across sessions must not suppress each other).
-const lastFinalByKey = new Map<string, string>();
 let liveCalls = new Map<string, any>();
 let streaming = false;
 // True from a follow-up transmit until the agent's next output. Bridges
@@ -61,13 +57,11 @@ function syncSendBtn() {
     btn.disabled = !inp.value.trim();
   }
 }
-// Pending follow-ups: fid -> {text, session key}. Sent immediately as
-// followUp with their own bubble; editable + steerable until the agent's
-// next text consumes them (then locked). Survives rebuilds via text
-// match in markFollowups; delegated clicks survive everything.
-type FollowEntry = { text: string; key: string };
-const followupPending = new Map<string, FollowEntry>();
-let followSeq = 0;
+// Mirror of pi's own queue, data-driven (see renderQueued). queue_update
+// carries the live {steering[], followUp[]} arrays; cleared on view
+// switch and refined by syncRunFlag's pendingMessageCount.
+type AgentQueue = { steering: string[]; followUp: string[] };
+let lastQueue: AgentQueue | null = null;
 // Fire-and-forget stop (button/Escape). Completion settles via agent_settled.
 function stopOnly() {
   awaitingResponse = false;
@@ -379,9 +373,6 @@ function markTurnActions() {
     if (k.classList.contains("msg") && k.classList.contains("assistant")) hasAsst = true;
   });
   flush();
-  // Pending-followup buttons live on user bubbles (delegated handlers),
-  // so re-mark on every toolbar pass: rebuilds wipe them, this restores.
-  markFollowups();
 }
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -603,12 +594,6 @@ function route(rec: any) {
         for (const b of rec.message.content) {
           if (b && b.type === "toolCall" && b.id) liveCalls.set(b.id, b);
         }
-        const ft = normText(textOf(rec.message.content));
-        if (ft) lastFinalByKey.set(viewKey, ft);
-      }
-      if (rec.message.role === "user") {
-        const t = textOf(rec.message.content);
-        if (t) pendingUser.delete(t);
       }
       return;
     }
@@ -623,15 +608,10 @@ function route(rec: any) {
       liveThinkBuf = "";
     }
     if (rec.message.role === "user") {
+      // Mirror: pi echoes user messages at delivery time, in true order.
+      // Always render the echo — no optimistic bubbles, no skip tokens,
+      // so the transcript can never disagree with pi's own history.
       liveRun = null;
-      // Already shown optimistically at send time; skip the echo.
-      // Set (not a variable): auto-sent drafts and quick manual sends
-      // can both be in flight; each echo matches and deletes itself.
-      const t = textOf(rec.message.content);
-      if (t && pendingUser.has(t)) {
-        pendingUser.delete(t);
-        return;
-      }
     }
     if (rec.message.role === "assistant" && Array.isArray(rec.message.content)) {
       for (const b of rec.message.content) {
@@ -655,15 +635,9 @@ function route(rec: any) {
       return;
     }
     if (rec.message.role === "assistant" && !textOf(rec.message.content)) return;
-    // Guard: never render the same assistant text twice in a row
-    // (streaming prediction vs final, or repeated turns, can double up).
-    // Normalized: a trailing newline must not defeat it. Per viewed
-    // session: identical texts across sessions must NOT suppress each other.
-    if (rec.message.role === "assistant") {
-      const ft = normText(textOf(rec.message.content));
-      if (ft && ft === normText(lastFinalByKey.get(viewKey) ?? "")) return;
-      if (ft) lastFinalByKey.set(viewKey, ft);
-    }
+    // Mirror: every assistant text renders, even exact repeats. pi shows
+    // them; suppressing was our invention (streaming made benign dupes,
+    // but the transcript must never disagree with pi's history).
     const n = msgNode(rec.message, liveCalls);
     $("msgs").appendChild(n);
     wireCopy(n);
@@ -672,13 +646,10 @@ function route(rec: any) {
     // Live text splits the Activity stream like history does: later
     // thoughts/tools start a new container below this bubble. Clear the
     // partial-think pointer too, or new deltas bleed into the old box.
-    // It also consumes pending follow-ups: the agent has now responded
-    // past them, so they move below this text and lock.
     if (rec.message.role === "assistant") {
       liveRun = null;
       liveThinkDiv = null;
       liveThinkBuf = "";
-      movePendingFollowups();
     }
     markTurnActions();
     return;
@@ -695,6 +666,17 @@ function route(rec: any) {
   }
   if (rec.type === "agent_settled") {
     finishRun();
+    return;
+  }
+  // Mirror of pi's queue: authoritative {steering[], followUp[]} snapshot.
+  // Already key-filtered to the viewed session upstream. Renders the
+  // queued bar (edit / promote-to-steer live here now, not on bubbles).
+  if (rec.type === "queue_update") {
+    lastQueue = {
+      steering: Array.isArray(rec.steering) ? rec.steering.filter((s: any) => typeof s === "string") : [],
+      followUp: Array.isArray(rec.followUp) ? rec.followUp.filter((s: any) => typeof s === "string") : [],
+    };
+    renderQueued();
     return;
   }
 }
@@ -714,6 +696,7 @@ function startRun() {
 const autoNamed = new Set<string>();
 
 // ChatGPT auto-titles chats: name an unnamed session from its first prompt.
+// (Deliberate divergence from pi defaults — pi's generated names are ids.)
 async function maybeAutoName() {
   try {
     const s = await pi.state(cwd);
@@ -964,11 +947,9 @@ async function refreshMsgs() {
     }
     let shown = 0;
     let run: HTMLElement | null = null;
-    let prevAssistant = "";
     const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
     for (const m of arr) {
       if (m.role === "system") continue;
-      if (m.role === "user") prevAssistant = "";
       // One Activity container per user request: thoughts and tool rows
       // interleave chronologically. A new user message starts a new one.
       if (m.role === "user") run = null;
@@ -987,13 +968,7 @@ async function refreshMsgs() {
       // Textless assistant turns (tool-call-only) would flash as empty
       // boxes; their content already lives in the Activity container.
       if (m.role === "assistant" && !textOf(m.content)) continue;
-      // Consecutive near-identical assistant turns (retries/replays) render
-      // once. Normalized so trailing whitespace can't defeat it.
-      if (m.role === "assistant") {
-        const t = normText(textOf(m.content));
-        if (t && t === prevAssistant) continue;
-        if (t) prevAssistant = t;
-      }
+      // Mirror: repeats render. (Dedup was ours; pi shows them.)
       const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
       const n = msgNode(m, calls, fid);
       box.appendChild(n);
@@ -1237,8 +1212,8 @@ function resetRunState() {
   liveRun = null;
   liveThinkDiv = null;
   liveThinkBuf = "";
-  lastFinalByKey.delete(viewKey);
-  pendingUser.clear();
+  lastQueue = null;
+  $("qbar")?.replaceChildren();
   lastRun = null;
   diffFiles.clear();
   selKey = null;
@@ -1301,6 +1276,20 @@ async function syncRunFlag() {
       syncSendBtn();
       showThinking();
     }
+    // Count-only queue fallback: texts arrive via queue_update, but a
+    // background queue predates our view of the session. Never invent
+    // texts — show the count until an event refines it (or zero clears).
+    if (typeof s?.pendingMessageCount === "number") {
+      if (s.pendingMessageCount > 0 && !lastQueue) {
+        lastQueue = { steering: [], followUp: [] };
+        const bar = $("qbar");
+        bar.innerHTML = "";
+        bar.appendChild(el("div", "qit", `<span class="qbadge">queue</span><span class="qtxt">${s.pendingMessageCount} message(s) queued with the agent…</span>`));
+      } else if (s.pendingMessageCount === 0 && lastQueue && !lastQueue.steering.length && !lastQueue.followUp.length) {
+        lastQueue = null;
+        $("qbar")?.replaceChildren();
+      }
+    }
   } catch { /* ignore */ }
 }
 
@@ -1312,23 +1301,25 @@ async function send() {
     if (streaming) stopOnly();
     return;
   }
-  // Mid-run text transmits immediately as followUp AND stays editable:
-  // the bubble carries edit + steer actions until the agent's next text
-  // consumes it (then locked). Only the stop button aborts.
+  // Mid-run text transmits as followUp without disturbing the run.
+  // No optimistic bubble: pi echoes at delivery time, in true order —
+  // the echo IS the render (mirroring the harness, never our own guess).
   if (streaming) {
     await sendFollowUp(text);
     return;
   }
   stick = true;
+  // Transmit-only: the bubble appears when pi echoes (milliseconds when
+  // idle). startRun's dots are the send acknowledgment. On failure the
+  // text goes back to the composer instead of being lost.
   inp.value = "";
   syncSendBtn();
   inp.style.height = "auto";
+  $("msgs").querySelector(".greet")?.remove();
   liveRun = null;
   liveThinkDiv = null;
   liveThinkBuf = "";
-  lastFinalByKey.delete(viewKey);
   liveCalls = new Map<string, any>();
-  appendUserOptimistic(text);
   startRun();
   try {
     await ensure(cwd, viewKey || undefined, viewPath);
@@ -1356,131 +1347,147 @@ async function send() {
     // only settle the UI when it is actually done (or lost, or 30min cap).
     watchRun(cwd);
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`send failed: ${e.message ?? e}`)));
+    $("msgs").appendChild(el("div", "msg sys", esc(`send failed (kept in composer): ${e.message ?? e}`)));
+    const inp2 = $("input") as HTMLTextAreaElement;
+    inp2.value = text;
+    syncSendBtn();
     finishRun();
   }
   persistLastCwd();
 }
 
-// Optimistic user bubble: shown instantly at send time; the echoed
-// user message_end later is skipped via pendingUser (see route).
-function appendUserOptimistic(text: string): void {
-  pendingUser.add(text);
-  $("msgs").querySelector(".greet")?.remove();
-  const box = el("div", "msg user");
-  box.appendChild(el("div", "ubody", renderMd(text)));
-  const wrap = el("div", "umsgwrap");
-  wrap.appendChild(box);
-  wrap.appendChild(el("div", "actions overlay", `<button class="act-copy iconbtn" title="Copy">${ICO_COPY}</button>`));
-  $("msgs").appendChild(wrap);
-  const mp2 = $("scrollwrap");
-  mp2.scrollTop = mp2.scrollHeight;
-}
-
-// Mid-run send: transmit immediately as followUp WITHOUT disturbing the
-// live run — no abort, no stream reset, no Activity-timer restart. The
-// bubble stays editable + steerable (markFollowups) until the agent's
-// next text consumes it (then locked via lockAllFollowups).
+// Mirror of pi's send path: transmit only, never render. The bubble appears
+// when pi echoes (message_end role=user) — at delivery, in true order.
+// Mid-run the echo lands when the message is accepted; idle, within ms.
+// Failures restore the text to the composer instead of losing it.
 async function sendFollowUp(text: string): Promise<void> {
   const inp = $("input") as HTMLTextAreaElement;
   inp.value = "";
   syncSendBtn();
   inp.style.height = "auto";
   stick = true;
-  liveRun = null;
-  liveThinkDiv = null;
-  liveThinkBuf = "";
-  const fid = `f${++followSeq}`;
-  followupPending.set(fid, { text, key: viewKey });
-  appendUserOptimistic(text);
-  // Pending look: dimmed + dashed until the agent takes it in (consume
-  // moves it below the in-progress response and locks it). The bubble
-  // must be visible now — edit/steer live on it.
-  const wraps = document.querySelectorAll("#msgs .umsgwrap");
-  const own = wraps[wraps.length - 1] as HTMLElement | undefined;
-  if (own) {
-    own.dataset.followup = fid;
-    own.classList.add("pending");
-  }
-  markFollowups();
   try {
     await ensure(cwd, viewKey || undefined, viewPath);
     if (viewKey) setKey(viewKey);
   } catch (e: any) {
     $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start: ${e.message ?? e}`)));
+    inp.value = text;
+    syncSendBtn();
     return;
   }
   try {
     await pi.prompt(cwd, text, "followUp");
     awaitingResponse = true;
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`follow-up failed (run continues): ${e.message ?? e}`)));
+    $("msgs").appendChild(el("div", "msg sys", esc(`follow-up failed, kept in composer (run continues): ${e.message ?? e}`)));
+    inp.value = text;
+    syncSendBtn();
   }
   persistLastCwd();
 }
 
-// Pending-followup toolbar: after every render pass, user bubbles whose
-// text is still unconsumed get edit + steer buttons (copy stays). Matches
-// by normalized text within the viewed session; delegated clicks below
-// do the work, so rebuilds and stream wipes can't strand handlers.
-function markFollowups(): void {
-  document.querySelectorAll("#msgs .umsgwrap").forEach((w) => {
-    const wrap = w as HTMLElement;
-    if (wrap.querySelector(".act-edit")) return;
-    const msg = wrap.querySelector(".msg");
-    const txt = (msg?.cloneNode(true) as HTMLElement | null)?.textContent?.trim() ?? "";
-    if (!txt) return;
-    let fid: string | null = null;
-    for (const [id, e] of followupPending) {
-      if (e.key === viewKey && normText(e.text) === normText(txt)) {
-        fid = id;
-        break;
-      }
+// Mirror of pi's queue: renders the authoritative queue_update snapshot
+// ({steering[], followUp[]}) as a slim bar above the composer. Edit and
+// promote-to-steer live here — on pi's data, not on guessed bubbles.
+// clear_queue returns the held texts, so edit/promote never lose content:
+// the target goes where asked, the rest are silently re-queued in order.
+function renderQueued(): void {
+  const bar = $("qbar");
+  bar.innerHTML = "";
+  const q = lastQueue;
+  if (!q || (!q.steering.length && !q.followUp.length)) return;
+  const items: Array<{ text: string; kind: "steer" | "followUp" }> = [
+    ...q.steering.map((text) => ({ text, kind: "steer" as const })),
+    ...q.followUp.map((text) => ({ text, kind: "followUp" as const })),
+  ];
+  for (const it of items) {
+    const row = el("div", "qit");
+    const badge = el("span", "qbadge" + (it.kind === "steer" ? " steer" : ""),
+      esc(it.kind === "steer" ? "steer" : "follow-up"));
+    const txt = el("span", "qtxt", esc(it.text));
+    txt.title = it.text;
+    const edit = el("button", "qedit", "edit") as HTMLButtonElement;
+    edit.title = "Edit queued message";
+    edit.addEventListener("click", () => editQueued(it.text, it.kind));
+    row.appendChild(badge);
+    row.appendChild(txt);
+    row.appendChild(edit);
+    if (it.kind === "followUp") {
+      const promote = el("button", "qpromote", "steer") as HTMLButtonElement;
+      promote.title = "Promote to steer (redirects the live run)";
+      promote.addEventListener("click", () => promoteQueued(it.text));
+      row.appendChild(promote);
     }
-    if (!fid) return;
-    const acts = wrap.querySelector(".actions");
-    if (!acts) return;
-    acts.insertAdjacentHTML(
-      "afterbegin",
-      `<button class="act-steer iconbtn" data-fid="${fid}" title="Send as steer (redirects the live run)">${ICO_STEER}</button>` +
-        `<button class="act-edit iconbtn" data-fid="${fid}" title="Edit follow-up">${ICO_EDIT}</button>`
-    );
-  });
-}
-
-function unmarkWrap(wrap: HTMLElement): void {
-  wrap.classList.remove("pending");
-  wrap.removeAttribute("data-followup");
-}
-
-function lockFollowup(fid: string): void {
-  followupPending.delete(fid);
-  const wrap = document.querySelector(`#msgs .umsgwrap[data-followup="${fid}"]`);
-  if (wrap) unmarkWrap(wrap as HTMLElement);
-  document.querySelectorAll(`[data-fid="${fid}"]`).forEach((b) => b.remove());
-}
-
-// Consume: the agent's next text took pending follow-ups in. Move them
-// below that response (their true transcript position — sent mid-turn,
-// accepted after it), drop the pending look, and lock edit/steer.
-function movePendingFollowups(): void {
-  const box = $("msgs");
-  const wraps = Array.from(box.querySelectorAll(".umsgwrap[data-followup]")) as HTMLElement[];
-  if (!wraps.length) return;
-  for (const w of wraps) {
-    const fid = w.dataset.followup ?? "";
-    box.appendChild(w);
-    unmarkWrap(w);
-    if (fid) {
-      followupPending.delete(fid);
-      document.querySelectorAll(`[data-fid="${fid}"]`).forEach((b) => b.remove());
-    }
+    bar.appendChild(row);
   }
-  pin();
 }
 
-const ICO_EDIT = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M13.5 3.5l3 3L8 15H5v-3l8.5-8.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
-const ICO_STEER = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 2v14m0-14L5.5 6.5M10 2l4.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16.5h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+// Edit a queued message, mirroring pi's own abort flow: clear the queue,
+// restore the target to the composer, re-queue everything else untouched.
+async function editQueued(text: string, kind: "steer" | "followUp"): Promise<void> {
+  let q: { steering: string[]; followUp: string[] };
+  try {
+    q = await pi.clearQueue(cwd);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`queue edit failed: ${e.message ?? e}`)));
+    return;
+  }
+  lastQueue = { steering: [], followUp: [] };
+  renderQueued();
+  const dropOnce = (arr: string[]): string[] => {
+    const i = arr.indexOf(text);
+    if (i < 0) return arr;
+    return [...arr.slice(0, i), ...arr.slice(i + 1)];
+  };
+  const reSteer = kind === "steer" ? dropOnce(q.steering) : q.steering;
+  const reFollow = kind === "followUp" ? dropOnce(q.followUp) : q.followUp;
+  const inp = $("input") as HTMLTextAreaElement;
+  inp.value = text;
+  inp.style.height = "auto";
+  inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+  syncSendBtn();
+  inp.focus();
+  for (const s of reSteer) {
+    try {
+      await pi.steerMsg(cwd, s);
+    } catch { /* backend busy: text stays only in composer then */ }
+  }
+  for (const f of reFollow) {
+    try {
+      await pi.followUpMsg(cwd, f);
+    } catch { /* ignore */ }
+  }
+}
+
+// Promote a queued follow-up to steer: same clear + re-queue, but the
+// target goes back via steer so it jumps ahead of the next model call.
+// (pi has no in-place promote; clear + resubmit is its own documented
+// shape for queue surgery.)
+async function promoteQueued(text: string): Promise<void> {
+  let q: { steering: string[]; followUp: string[] };
+  try {
+    q = await pi.clearQueue(cwd);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
+    return;
+  }
+  lastQueue = { steering: [], followUp: [] };
+  renderQueued();
+  const rest = q.followUp.filter((f) => f !== text);
+  try {
+    await pi.steerMsg(cwd, text);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
+    const inp = $("input") as HTMLTextAreaElement;
+    inp.value = text;
+    syncSendBtn();
+  }
+  for (const f of rest) {
+    try {
+      await pi.followUpMsg(cwd, f);
+    } catch { /* ignore */ }
+  }
+}
 async function persistLastCwd() {
   try {
     await config.set({ last_cwd: cwd });
@@ -1599,52 +1606,12 @@ async function openSettings() {
 
 // ---- boot ----
 
-  // Hover toolbars: copy message text, speak it, revert (fork) at a user
-  // message, or edit / steer a still-pending follow-up. Sending after a
-  // revert forks a branch (shows "No summary" in pi's tree view until
-  // pi summarizes the abandoned branch).
+  // Hover toolbars: copy message text, speak it, or revert (fork) at a user
+  // message. Queued-message edit/steer live on the queue bar (pi's data),
+  // not on bubbles. Sending after a revert forks a branch (shows
+  // "No summary" in pi's tree view until pi summarizes the abandoned
+  // branch).
   document.addEventListener("click", async (e) => {
-    const ed = (e.target as HTMLElement).closest?.(".act-edit") as HTMLButtonElement | null;
-    if (ed?.dataset.fid) {
-      // Edit a pending follow-up: lock this bubble, hand the text back to
-      // the composer. Enter re-sends it (re-queued if still running).
-      e.stopPropagation();
-      const t = followupPending.get(ed.dataset.fid)?.text;
-      lockFollowup(ed.dataset.fid);
-      if (t) {
-        const inp = $("input") as HTMLTextAreaElement;
-        inp.value = t;
-        inp.style.height = "auto";
-        inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
-        syncSendBtn();
-        inp.focus();
-      }
-      return;
-    }
-    const st = (e.target as HTMLElement).closest?.(".act-steer") as HTMLButtonElement | null;
-    if (st?.dataset.fid) {
-      // Steer: redirect the live run with this text, immediately. Locked
-      // after firing; at idle it degrades to a normal composer send.
-      e.stopPropagation();
-      const t = followupPending.get(st.dataset.fid)?.text;
-      lockFollowup(st.dataset.fid);
-      if (!t) return;
-      if (streaming) {
-        try {
-          await ensure(cwd, viewKey || undefined, viewPath);
-          if (viewKey) setKey(viewKey);
-          await pi.prompt(cwd, t, "steer");
-        } catch (err: any) {
-          $("msgs").appendChild(el("div", "msg sys", esc(`steer failed (run continues): ${err.message ?? err}`)));
-        }
-      } else {
-        const inp = $("input") as HTMLTextAreaElement;
-        inp.value = t;
-        syncSendBtn();
-        send();
-      }
-      return;
-    }
     const rv = (e.target as HTMLElement).closest?.(".act-revert") as HTMLButtonElement | null;
     if (rv?.dataset.entry) {
       e.stopPropagation();

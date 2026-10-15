@@ -167,9 +167,6 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 .msg { font-size: 14px; }
 .msg.user { align-self: flex-end; max-width: min(75%, 640px); background: var(--bubble); border-radius: 24px; padding: 6px 16px; }
 .msg.user .ubody { line-height: 22px; }
-/* Pending follow-up: sent mid-turn, not yet taken in. Dimmed + dashed
-   until consume moves it below the in-progress response and locks it. */
-.umsgwrap.pending .msg.user { opacity: 0.65; border: 1px dashed var(--border); }
 .msg.assistant { align-self: stretch; position: relative; padding: 0; border: none; background: none; line-height: 24px; }
 .msg.sys { align-self: stretch; color: var(--dim); font-size: 13px; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 12px; background: none; }
 .msg.stream { opacity: 0.95; }
@@ -214,6 +211,17 @@ details.toolrow > summary:hover { color: var(--text); }
 .thinking i:nth-child(2) { animation-delay: 0.2s; }
 .thinking i:nth-child(3) { animation-delay: 0.4s; }
 @keyframes tblink { 0%, 60%, 100% { opacity: 0.25; } 30% { opacity: 1; } }
+
+/* agent queue bar: mirrors pi's own queued steering/follow-up list.
+   Data-driven from queue_update events; empty = hidden. */
+#qbar:empty { display: none; }
+#qbar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.qit { display: flex; align-items: center; gap: 8px; border: 1px dashed var(--border); border-radius: 12px; padding: 6px 8px; font-size: 13px; }
+.qbadge { flex: none; font-size: 11px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--dim); }
+.qbadge.steer { color: #000; background: #fff; border-color: #fff; }
+.qtxt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.qedit, .qpromote { flex: none; border: none; color: var(--dim); font-size: 12px; padding: 2px 8px; }
+.qedit:hover, .qpromote:hover { color: var(--text); }
 
 /* composer: one pill box, tools bottom-left, send bottom-right (ChatGPT) */
 #composer { background: var(--surface); border: none; border-radius: 28px; padding: 10px 10px 10px 22px; margin: 0 24px 24px; max-width: 1024px; width: calc(100% - 48px); align-self: center; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13); }

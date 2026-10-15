@@ -95,7 +95,14 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
     procs.delete(pkey);
   }
   fs.mkdirSync(cwd, { recursive: true });
+  // Same media primer as the Tauri backend (see src/media-primer.md):
+  // capability + agent knowledge ship together, no skill install step.
+  let primer = null;
+  try {
+    primer = fs.readFileSync(new URL("../src/media-primer.md", import.meta.url), "utf8");
+  } catch {}
   const args = ["--mode", "rpc"];
+  if (primer) args.push("--append-system-prompt", primer);
   if (sessionDir) args.push("--session-dir", sessionDir);
   if (sessionPath) args.push("--session", sessionPath);
   const child = spawn(piBin(), args, { cwd, stdio: ["pipe", "pipe", "ignore"] });

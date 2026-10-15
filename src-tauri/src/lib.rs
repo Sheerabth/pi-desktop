@@ -14,6 +14,14 @@ use base64::Engine as _;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
 
+// Media primer: what the desktop chat can render (mirrors src/md.ts —
+// keep the extension lists and syntax forms in sync). Embedded at
+// compile time so installed builds carry it with no repo present, and
+// appended to every pi child's system prompt: capability and agent
+// knowledge ship as one unit, no separate skill install, no trigger
+// gambling. web-backend.mjs reads the same file for browser dev.
+const MEDIA_PRIMER: &str = include_str!("../../src/media-primer.md");
+
 // ---------------------------------------------------------------- config
 
 fn bg_default() -> bool {
@@ -158,6 +166,8 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     let mut cmd = Command::new(pi_bin());
     cmd.arg("--mode")
         .arg("rpc")
+        .arg("--append-system-prompt")
+        .arg(MEDIA_PRIMER)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

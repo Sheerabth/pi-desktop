@@ -128,6 +128,16 @@ export const pi = {
 
   forkMessages: (cwd: string) => call(cwd, { type: "get_fork_messages" }),
   fork: (cwd: string, entryId: string) => call(cwd, { type: "fork", entryId }),
+
+  // Mid-run queue primitives (mirror of pi's own API; backend forwards).
+  // steer()/followUp() enqueue server-side; clearQueue() returns the held
+  // {steering[], followUp[]} so the UI can restore them to the editor.
+  steerMsg: (cwd: string, message: string) =>
+    call(cwd, { type: "steer", message }),
+  followUpMsg: (cwd: string, message: string) =>
+    call(cwd, { type: "follow_up", message }),
+  clearQueue: (cwd: string): Promise<{ steering: string[]; followUp: string[] }> =>
+    call(cwd, { type: "clear_queue" }),
 };
 
 // new_session / switch_session / fork ACK immediately but switch
