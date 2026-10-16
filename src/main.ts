@@ -3,7 +3,7 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
-import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, stopChild, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -35,6 +35,14 @@ function pin() {
   if (!stick) return;
   const m = $("scrollwrap");
   m.scrollTop = m.scrollHeight;
+}
+// Unconditional drop-to-bottom on send: the user asked for it, output or
+// not. Unlike pin() this ignores `stick` — pressing Enter means "take me
+// to the latest", even from a scrolled-up view.
+function dropToBottom(): void {
+  stick = true;
+  const m = $("scrollwrap");
+  if (m) m.scrollTop = m.scrollHeight;
 }
 // Late media bytes extend the page under a pinned viewport (the #1
 // autoscroll miss: text pinned fine, then images landed below it).
@@ -1057,6 +1065,7 @@ function closeDrops() {
   $("modellist").classList.add("hidden");
   $("thinklist").classList.add("hidden");
   $("dirlist").classList.add("hidden");
+  hideCmdList();
   $("modelbtn").classList.remove("open");
   $("thinkbtn").classList.remove("open");
   $("dirbtn").classList.remove("open");
@@ -1155,6 +1164,159 @@ function renderThinkOpts() {
   );
 }
 
+// ---- slash commands (get_commands + local TUI equivalents) ----
+// pi RPC executes /cmd via prompt(); get_commands lists extension +
+// prompt-template + skill commands. Built-in TUI commands never come
+// over RPC, so a small local set is handled client-side.
+let allCommands: PiCommand[] = [];
+
+async function refreshCommands(): Promise<void> {
+  if (!cwd) return;
+  try {
+    const data = await pi.commands(cwd);
+    allCommands = data?.commands ?? [];
+  } catch {
+    allCommands = [];
+  }
+  renderCmdList();
+}
+
+function localCmds(): PiCommand[] {
+  return [
+    { name: "new", description: "Start a new chat", source: "extension" },
+    { name: "model", description: "Open model picker", source: "extension" },
+    { name: "thinking", description: "Open thinking picker", source: "extension" },
+    { name: "reload", description: "Reload models + commands", source: "extension" },
+  ];
+}
+
+function cmdPool(): PiCommand[] {
+  const seen = new Set(allCommands.map((c) => c.name));
+  return [...localCmds().filter((c) => !seen.has(c.name)), ...allCommands];
+}
+
+function slashFrag(): string | null {
+  const inp = $("input") as HTMLTextAreaElement | null;
+  if (!inp) return null;
+  const v = inp.value;
+  if (!v.startsWith("/")) return null;
+  // Only the leading token drives completion ("/fix arg" -> "fix").
+  const m = v.match(/^\/(\S*)/);
+  if (m == null) return null;
+  // Multiline paste: only complete when caret is still on line 1.
+  const nl = v.indexOf("\n");
+  if (nl >= 0 && (inp.selectionStart ?? 0) > nl) return null;
+  return m[1].toLowerCase();
+}
+
+function renderCmdList(): void {
+  const box = $("cmdlist");
+  if (!box) return;
+  cmdArrowed = false;
+  const frag = slashFrag();
+  if (frag == null) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const shown = cmdPool()
+    .filter((c) => c.name.toLowerCase().includes(frag))
+    .slice(0, 12);
+  box.innerHTML = "";
+  if (!shown.length) {
+    box.appendChild(el("div", "dd-opt", "(no matching command — Enter to send anyway)"));
+    box.classList.remove("hidden");
+    return;
+  }
+  for (const c of shown) {
+    const o = el(
+      "div",
+      "dd-opt cmdopt" + (box.childElementCount === 0 ? " hl" : ""),
+      `<span class="cmdname">/${esc(c.name)}</span><span class="cmddesc">${esc(c.description ?? c.source)}</span>`
+    );
+    (o as HTMLElement).dataset.v = c.name;
+    o.addEventListener("mousedown", (e) => {
+      // mousedown (not click): complete before textarea blur hides us.
+      e.preventDefault();
+      pickCmd(c.name);
+    });
+    box.appendChild(o);
+  }
+  box.classList.remove("hidden");
+}
+
+// True once the user arrow-navigates the open popup. Enter sends by
+// default (Tab completes); Enter only picks after explicit navigation.
+let cmdArrowed = false;
+
+function pickCmd(name: string): void {
+  const inp = $("input") as HTMLTextAreaElement;
+  const rest = inp.value.match(/^\/\S*(.*)$/s)?.[1] ?? "";
+  inp.value = `/${name}` + (rest.startsWith(" ") || rest === "" ? rest : ` ${rest}`);
+  // Caret to end so args can be typed immediately.
+  inp.selectionStart = inp.selectionEnd = inp.value.length;
+  inp.focus();
+  renderCmdList();
+  syncSendBtn();
+}
+
+function hideCmdList(): void {
+  $("cmdlist")?.classList.add("hidden");
+}
+
+// Returns true when the text was a local command and is fully handled.
+async function runLocalCmd(text: string): Promise<boolean> {
+  const m = text.match(/^\/(\S+)\s*(.*)$/s);
+  if (!m) return false;
+  const name = m[1].toLowerCase();
+  if (name === "new") {
+    resetRunState();
+    hideCmdList();
+    try {
+      await openFresh();
+    } catch (e: any) {
+      alert(`new chat failed: ${e.message ?? e}`);
+    }
+    ($("input") as HTMLTextAreaElement).value = "";
+    syncSendBtn();
+    refreshAll(false);
+    return true;
+  }
+  if (name === "model") {
+    hideCmdList();
+    ($("input") as HTMLTextAreaElement).value = "";
+    syncSendBtn();
+    closeDrops();
+    $("modellist").classList.remove("hidden");
+    ($("modelbtn") as HTMLButtonElement).classList.add("open");
+    renderModelOpts();
+    ($("modeltype") as HTMLInputElement).focus();
+    return true;
+  }
+  if (name === "thinking") {
+    hideCmdList();
+    ($("input") as HTMLTextAreaElement).value = "";
+    syncSendBtn();
+    closeDrops();
+    $("thinklist").classList.remove("hidden");
+    ($("thinkbtn") as HTMLButtonElement).classList.add("open");
+    renderThinkOpts();
+    ($("thinktype") as HTMLInputElement).focus();
+    return true;
+  }
+  if (name === "reload") {
+    hideCmdList();
+    ($("input") as HTMLTextAreaElement).value = "";
+    syncSendBtn();
+    await refreshModels();
+    await refreshCommands();
+    $("msgs").appendChild(el("div", "msg sys", "reloaded models + commands"));
+    dropToBottom();
+    return true;
+  }
+  return false;
+}
+
 // Async: history load is awaited so late arrivers (thinking dots) can
 // never land before the transcript they belong under. Callers that don't
 // care may ignore the promise.
@@ -1163,6 +1325,8 @@ async function refreshAll(withModels: boolean): Promise<void> {
   await refreshMsgs();
   if (withModels) await refreshModels();
   else await refreshState();
+  // Commands are cheap + drive "/" completion; never block the view on them.
+  refreshCommands().catch(() => {});
 }
 
 // Light refresh: sidebar + header only. The live stream already built the
@@ -1221,6 +1385,7 @@ function resetRunState() {
   liveThinkBuf = "";
   lastQueue = null;
   $("qbar")?.replaceChildren();
+  hideCmdList();
   lastRun = null;
   diffFiles.clear();
   selKey = null;
@@ -1308,14 +1473,19 @@ async function send() {
     if (streaming) stopOnly();
     return;
   }
-  // Mid-run text transmits as followUp without disturbing the run.
-  // No optimistic bubble: pi echoes at delivery time, in true order —
-  // the echo IS the render (mirroring the harness, never our own guess).
+  const isSlash = text.startsWith("/");
+  // Local commands (/new, /model, …) never reach the agent.
+  if (!streaming && isSlash && (await runLocalCmd(text))) return;
+  // Slash commands execute immediately via prompt() even mid-run —
+  // never queue them as steer/followUp (pi rejects those).
   if (streaming) {
-    await sendFollowUp(text);
+    if (isSlash) await sendSlashMidRun(text);
+    else await sendFollowUp(text);
     return;
   }
   stick = true;
+  hideCmdList();
+  dropToBottom();
   // Transmit-only: the bubble appears when pi echoes (milliseconds when
   // idle). startRun's dots are the send acknowledgment. On failure the
   // text goes back to the composer instead of being lost.
@@ -1347,12 +1517,22 @@ async function send() {
     }
   }).catch(() => {});
   try {
-    await pi.prompt(cwd, text);
-    // Completion arrives via agent_settled. Watchdog (not a fixed timer):
-    // the old 180s safety net declared the run finished while long agents
-    // were still working. Now we poll the agent's own isStreaming flag and
-    // only settle the UI when it is actually done (or lost, or 30min cap).
-    watchRun(cwd);
+    const res: any = await pi.prompt(cwd, text);
+    if (res?.disposition === "handled") {
+      // Extension command consumed the prompt: no run started, so no
+      // agent_settled will ever arrive. Settle now and reload history —
+      // the command's own output (if any) arrives as messages.
+      // Note: handled commands add no user echo to history; what you
+      // typed won't show as a bubble, only the command's output does.
+      finishRun();
+      await refreshMsgs();
+    } else {
+      // Completion arrives via agent_settled. Watchdog (not a fixed timer):
+      // the old 180s safety net declared the run finished while long agents
+      // were still working. Now we poll the agent's own isStreaming flag and
+      // only settle the UI when it is actually done (or lost, or 30min cap).
+      watchRun(cwd);
+    }
   } catch (e: any) {
     $("msgs").appendChild(el("div", "msg sys", esc(`send failed (kept in composer): ${e.message ?? e}`)));
     const inp2 = $("input") as HTMLTextAreaElement;
@@ -1373,6 +1553,7 @@ async function sendFollowUp(text: string): Promise<void> {
   syncSendBtn();
   inp.style.height = "auto";
   stick = true;
+  dropToBottom();
   try {
     await ensure(cwd, viewKey || undefined, viewPath);
     if (viewKey) setKey(viewKey);
@@ -1391,6 +1572,25 @@ async function sendFollowUp(text: string): Promise<void> {
     syncSendBtn();
   }
   persistLastCwd();
+}
+
+// Slash command fired mid-run: pi runs extension commands immediately
+// (no queue), so transmit via bare prompt() without touching run UI.
+// No startRun/watchRun — a run is already live and owns completion.
+async function sendSlashMidRun(text: string): Promise<void> {
+  const inp = $("input") as HTMLTextAreaElement;
+  hideCmdList();
+  dropToBottom();
+  inp.value = "";
+  syncSendBtn();
+  inp.style.height = "auto";
+  try {
+    await pi.prompt(cwd, text);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`command failed: ${e.message ?? e}`)));
+    inp.value = text;
+    syncSendBtn();
+  }
 }
 
 // Mirror of pi's queue: renders the authoritative queue_update snapshot
@@ -1659,12 +1859,44 @@ window.addEventListener("DOMContentLoaded", async () => {
   inp.addEventListener("input", () => {
     autogrow();
     syncSendBtn();
+    renderCmdList();
   });
   inp.addEventListener("keydown", (e) => {
+    const cmdOpen = !$("cmdlist")?.classList.contains("hidden");
+    if (cmdOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      menuMove($("cmdlist"), e.key === "ArrowDown" ? 1 : -1);
+      cmdArrowed = true;
+      return;
+    }
+    // Tab always completes the highlighted/first match. Enter sends —
+    // unless the user just arrowed to a row, in which case it picks it.
+    if (cmdOpen && e.key === "Tab") {
+      const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
+      const first = $("cmdlist").querySelector('.dd-opt[data-v]') as HTMLElement | null;
+      if (hl ?? first) {
+        e.preventDefault();
+        pickCmd(((hl ?? first) as HTMLElement).dataset.v!);
+      }
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
+      if (cmdOpen && cmdArrowed) {
+        const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
+        if (hl) {
+          e.preventDefault();
+          pickCmd(hl.dataset.v!);
+          return;
+        }
+      }
       e.preventDefault();
       send();
     } else if (e.key === "Escape") {
+      if (cmdOpen) {
+        e.preventDefault();
+        hideCmdList();
+        return;
+      }
       e.preventDefault();
       stopOnly();
     }

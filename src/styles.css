@@ -224,7 +224,12 @@ details.toolrow > summary:hover { color: var(--text); }
 .qedit:hover, .qpromote:hover { color: var(--text); }
 
 /* composer: one pill box, tools bottom-left, send bottom-right (ChatGPT) */
-#composer { background: var(--surface); border: none; border-radius: 28px; padding: 10px 10px 10px 22px; margin: 0 24px 24px; max-width: 1024px; width: calc(100% - 48px); align-self: center; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13); }
+#composer { background: var(--surface); border: none; border-radius: 28px; padding: 10px 10px 10px 22px; margin: 0 24px 24px; max-width: 1024px; width: calc(100% - 48px); align-self: center; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13); position: relative; }
+/* slash-command completion: same chrome as model/dir menus, full width */
+#cmdlist { position: absolute; bottom: calc(100% + 8px); left: 12px; right: 12px; max-height: 300px; overflow-y: auto; background: #2f2f2f; border: 1px solid var(--border); border-radius: 12px; padding: 4px; z-index: 40; }
+#cmdlist .cmdopt { display: flex; gap: 10px; align-items: baseline; }
+#cmdlist .cmdname { flex: none; font-family: var(--mono); font-size: 13px; color: var(--text); }
+#cmdlist .cmddesc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--dim); }
 #input { width: 100%; resize: none; background: transparent; border: none; border-radius: 0; padding: 4px; font-size: 14px; line-height: 22px; }
 #input::placeholder { color: #afafaf; }
 #input:focus { border: none; }

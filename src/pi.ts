@@ -129,6 +129,12 @@ export const pi = {
   forkMessages: (cwd: string) => call(cwd, { type: "get_fork_messages" }),
   fork: (cwd: string, entryId: string) => call(cwd, { type: "fork", entryId }),
 
+  // Discoverable slash commands: extension commands, prompt templates,
+  // skills. Run one via prompt("/name args"). Built-in TUI commands
+  // (/settings, /model, …) are NOT included — handle those locally.
+  commands: (cwd: string): Promise<{ commands: PiCommand[] }> =>
+    call(cwd, { type: "get_commands" }),
+
   // Mid-run queue primitives (mirror of pi's own API; backend forwards).
   // steer()/followUp() enqueue server-side; clearQueue() returns the held
   // {steering[], followUp[]} so the UI can restore them to the editor.
@@ -154,6 +160,13 @@ export async function awaitSession(cwd: string, before: string | null, want?: st
     await new Promise((r) => setTimeout(r, 200));
   }
   return null;
+}
+
+export interface PiCommand {
+  name: string;
+  description?: string;
+  source: "extension" | "prompt" | "skill";
+  sourceInfo?: any;
 }
 
 export interface SessionInfo {
