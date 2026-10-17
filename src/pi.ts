@@ -184,6 +184,16 @@ export const sessions = {
   del: (path: string): Promise<void> => invoke("delete_session", { path, sessionRoot: null }),
 };
 
+// Transcript of one spawned subagent (agent/SPAWN.md). Scoped server-side
+// to the spawn-sessions root. Returns {messages} in get_messages shape.
+export const spawnTranscript = {
+  read: (runId: string): Promise<{ messages: any[] }> =>
+    // Tauri maps JS camelCase to Rust snake_case: must be runId here.
+    invoke("read_spawn_transcript", { runId }),
+  remove: (runId: string): Promise<void> =>
+    invoke("delete_spawn_run", { runId }),
+};
+
 export interface AppConfig {
   quickbar_hotkey: string;
   main_hotkey: string;

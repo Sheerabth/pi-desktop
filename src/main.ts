@@ -3,7 +3,7 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
-import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -133,7 +133,7 @@ function noteDiff(ref: DiffRef) {
   const tn = (ref.tool || "").toLowerCase();
   if (tn !== "edit" && tn !== "write") return;
   trackDiff(ref);
-  if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+  if (changesVisible()) renderDiffPane();
 }
 function refCounts(r: DiffRef): string {
   const t = (r.tool || "").toLowerCase();
@@ -206,12 +206,37 @@ function renderDiffPane() {
   body.appendChild(renderDiffBody(viewRef));
   wireCopy(body);
 }
-// Single owner of pane visibility: hidden flag, wide-feed layout flag and
-// header-button state always move together, so they can't get stuck apart.
-function setDiffPane(open: boolean) {
-  $("diffpane").classList.toggle("hidden", !open);
-  ($("diffbtn") as HTMLButtonElement).classList.toggle("open", open);
-  if (open) renderDiffPane();
+// One shared sidebar, two tabs, one visible at a time. Changes and
+// Subagents share the pane, the resize handle, and the saved width —
+// never side by side, never crammed together.
+let sideTabCur: "changes" | "agents" = "changes";
+function sideIsOpen(): boolean {
+  return !$("sidepane").classList.contains("hidden");
+}
+function changesVisible(): boolean {
+  return sideIsOpen() && sideTabCur === "changes";
+}
+function agentsVisible(): boolean {
+  return sideIsOpen() && sideTabCur === "agents";
+}
+function setSidePane(tab: "changes" | "agents" | null) {
+  if (tab === null) {
+    $("sidepane").classList.add("hidden");
+  } else {
+    sideTabCur = tab;
+    $("sidepane").classList.remove("hidden");
+    document.querySelectorAll("#sidetabs .sidetab").forEach((b) =>
+      b.classList.toggle("cur", (b as HTMLElement).dataset.tab === tab));
+    $("diffwrap").classList.toggle("hidden", tab !== "changes");
+    $("agentswrap").classList.toggle("hidden", tab !== "agents");
+    if (tab === "changes") renderDiffPane();
+    else renderAgents();
+  }
+  syncPaneBtns();
+}
+function syncPaneBtns() {
+  ($("diffbtn") as HTMLButtonElement).classList.toggle("open", changesVisible());
+  ($("agentsbtn") as HTMLButtonElement).classList.toggle("open", agentsVisible());
 }
 const toolElapsed = new Map<string, number>(); // toolCallId -> durationMs (server-reported)
 let runT0 = 0;
@@ -412,6 +437,13 @@ function textOf(c: any): string {
 
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
   const role = m.role ?? "unknown";
+  // App-owned subagents (see agent/SPAWN.md): one collapsed card per
+  // child — dispatch + result inline, detail behind the click, index in
+  // the Agents panel. Tracked here so history rebuilds and live appends
+  // share one code path.
+  if (role === "custom" && typeof m.customType === "string" && m.customType.startsWith("spawn-")) {
+    return spawnCard(m);
+  }
   if (role === "user") {
     const box = el("div", "msg user");
     box.appendChild(el("div", "ubody", renderMd(textOf(m.content) || "(empty)")));
@@ -492,6 +524,415 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ---- spawned subagents (app-owned; see agent/SPAWN.md) ----
+// Sessions all the way down: the panel is an index over spawn-* messages
+// (dispatch + result inline, detail behind the click). One map, fed by
+// msgNode, so live appends and history rebuilds can never disagree.
+type SpawnInfo = { id: string; label: string; state: string; startedAt?: number; durationMs?: number; runId?: string; result?: string };
+const spawns = new Map<string, SpawnInfo>();
+
+function threadOf(d: any): string {
+  return typeof d.thread === "string" && d.thread ? d.thread : d.id;
+}
+
+function trackSpawn(m: any): void {
+  const ct: string = m.customType ?? "";
+  const d = m.details ?? {};
+  // Tombstones: deletes persist in parent history as notes, so rebuilds
+  // re-bury them. Keyed by viewed session; cheap cached parse.
+  if (d.deleted && d.id) {
+    burySpawn(threadOf(d));
+    spawns.delete(threadOf(d));
+    if (selSpawn === threadOf(d)) {
+      selSpawn = null;
+      detailCount = -1;
+    }
+    updateAgentsBtn();
+    if (agentsVisible()) renderAgents();
+    return;
+  }
+  if (ct === "spawn-started" && d.id) {
+    const tid = threadOf(d);
+    if (tombstones().has(tid)) return;
+    const prev = spawns.get(tid);
+    // One row per conversation: continuations flip the SAME row back to
+    // running and retarget it at the new run. First-seen label wins.
+    spawns.set(tid, {
+      id: tid,
+      label: prev?.label ?? d.label ?? tid,
+      state: "running",
+      startedAt: prev?.startedAt ?? (typeof d.startedAt === "number" ? d.startedAt : undefined),
+      runId: d.id,
+    });
+  } else if ((ct === "spawn-done" || ct === "spawn-stopped") && d.id) {
+    const tid = threadOf(d);
+    if (tombstones().has(tid)) return;
+    const s: SpawnInfo = spawns.get(tid) ?? { id: tid, label: d.label ?? tid, state: "running" };
+    s.state = d.status ?? (ct === "spawn-done" ? "done" : "stopped");
+    s.runId = d.id;
+    if (typeof d.durationMs === "number") s.durationMs = d.durationMs;
+    // The report lives on the dispatch card: stash it for morph.
+    // Completions are display:false (tracked, never rendered as cards).
+    if (typeof m.content === "string" && m.content) s.result = m.content.slice(0, 12000);
+    else if (textOf(m.content)) s.result = textOf(m.content).slice(0, 12000);
+    spawns.set(tid, s);
+    morphSpawnCards(tid);
+  } else {
+    return;
+  }
+  updateAgentsBtn();
+  if (agentsVisible()) renderAgents();
+}
+
+function spawnElapsed(s: SpawnInfo): string {
+  const ms = typeof s.durationMs === "number" ? s.durationMs
+    : typeof s.startedAt === "number" ? Date.now() - s.startedAt : -1;
+  if (ms < 0) return "";
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function spawnDot(state: string): string {
+  const cls = state === "running" ? "running" : state === "done" ? "done" : "stopped";
+  const glyph = state === "running" ? "◌" : state === "done" ? "●" : "■";
+  return `<span class="sdot ${cls}">${glyph}</span>`;
+}
+
+function spawnSummaryHTML(s: SpawnInfo): string {
+  const running = s.state === "running";
+  // Actions target the live RUN; rows and deletes target the THREAD.
+  const run = s.runId ?? s.id;
+  return spawnDot(s.state) +
+    `<span class="splabel">${esc(s.label)}</span>` +
+    `<span class="spsid">${esc(s.id.slice(-6))}</span>` +
+    `<span class="spelapsed">${esc(spawnElapsed(s))}</span>` +
+    (running
+      ? `<span class="spacts"><button class="ssteer" data-id="${esc(run)}" title="Steer this subagent">steer</button>` +
+        `<button class="sstop" data-id="${esc(run)}" title="Stop this subagent">stop</button></span>`
+      : "");
+}
+
+// A done/stopped notice supersedes its dispatch card: morph the old card
+// in place (state, elapsed, buttons) so no stale "running + stop"
+// lingers. New card still renders below with the full report.
+function morphSpawnCards(id: string): void {
+  const s = spawns.get(id);
+  if (!s) return;
+  for (const card of Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
+    const sum = card.querySelector(":scope > summary");
+    if (sum) sum.innerHTML = spawnSummaryHTML(s);
+    (card as HTMLElement).dataset.state = s.state;
+    // The answer lands in the ORIGINAL card: fill the running placeholder
+    // or append the report once. Never a second card.
+    const ph = card.querySelector(":scope > .spbody[data-ph]");
+    if (s.result && ph) {
+      ph.removeAttribute("data-ph");
+      ph.innerHTML = renderMd(s.result);
+      wireCopy(card as HTMLElement);
+    } else if (s.result && !card.querySelector(":scope > .spbody")) {
+      const body = document.createElement("div");
+      body.className = "spbody";
+      body.innerHTML = renderMd(s.result);
+      card.appendChild(body);
+      wireCopy(card as HTMLElement);
+    }
+  }
+}
+
+function spawnCard(m: any): HTMLElement {
+  trackSpawn(m);
+  const ct: string = m.customType ?? "";
+  const d = m.details ?? {};
+  const id: string = d.id ?? "";
+  if (ct === "spawn-note") {
+    return el("div", "msg sys spawnnote", renderMd(textOf(m.content).slice(0, 2000)));
+  }
+  const label = d.label ?? "subagent";
+  const running = ct === "spawn-started";
+  const state = running ? "running" : (d.status ?? (ct === "spawn-done" ? "done" : "stopped"));
+  const info: SpawnInfo = {
+    id, label, state,
+    ...(typeof d.durationMs === "number" ? { durationMs: d.durationMs } : {}),
+    ...(typeof d.startedAt === "number" ? { startedAt: d.startedAt } : {}),
+  };
+  const wrap = el("details", "spawncard");
+  // Dispatch cards start collapsed; old completed cards (pre-silent era)
+  // keep their open report. Answers land here via morph, never as new cards.
+  (wrap as HTMLDetailsElement).open = !running && ct === "spawn-done";
+  // Card identity is the THREAD: continuations morph the same cards.
+  if (d.id) wrap.dataset.spawnId = threadOf(d);
+  wrap.dataset.state = state;
+  wrap.appendChild(el("summary", "spsum", spawnSummaryHTML(info)));
+  if (!running) {
+    const body = el("div", "spbody", renderMd(textOf(m.content).slice(0, 12000)));
+    wrap.appendChild(body);
+    wireCopy(wrap);
+  } else {
+    const ph = el("div", "spbody", `<span class="dim">Running…</span>`);
+    (ph as HTMLElement).dataset.ph = "1";
+    wrap.appendChild(ph);
+  }
+  // Late supersede: if done already arrived, morph immediately.
+  if (d.id && !running) morphSpawnCards(threadOf(d));
+  return wrap;
+}
+
+function updateAgentsBtn(): void {
+  const n = [...spawns.values()].filter((s) => s.state === "running").length;
+  const badge = $("agentsbadge");
+  badge.textContent = n ? String(n) : "";
+  badge.classList.toggle("hidden", !n);
+}
+
+function renderAgents(): void {
+  renderAgentsList();
+  const t = $("agenttranscript");
+  if (selSpawn) {
+    void renderSpawnDetail(selSpawn);
+  } else {
+    t.innerHTML = "";
+    t.dataset.detail = "";
+    detailCount = -1;
+  }
+}
+
+let listSig = "";
+
+// Parent history is append-only: a delete lands as a spawn-note with
+// details.deleted, so rebuilds re-bury it. Tombstones persist per
+// viewed session in localStorage.
+let tombCacheKey = "";
+let tombCache = new Set<string>();
+function tombstones(): Set<string> {
+  const key = "spawn-deleted:" + viewKey;
+  if (key !== tombCacheKey) {
+    tombCacheKey = key;
+    try {
+      const raw = localStorage.getItem(key);
+      const arr = raw ? JSON.parse(raw) as unknown : [];
+      tombCache = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
+    } catch {
+      tombCache = new Set();
+    }
+  }
+  return tombCache;
+}
+function burySpawn(id: string): void {
+  const s = tombstones();
+  s.add(id);
+  try {
+    localStorage.setItem(tombCacheKey, JSON.stringify([...s]));
+  } catch { /* private mode */ }
+}
+
+function renderAgentsList(): void {
+  const body = $("agentsbody");
+  $("agentstitle").textContent = "Subagents";
+  if (!spawns.size) {
+    listSig = "";
+    body.innerHTML = "";
+    body.appendChild(el("div", "msg sys", "No subagents this session. Ask Pi to spawn one."));
+    return;
+  }
+  const all = [...spawns.values()];
+  const running = all.filter((s) => s.state === "running");
+  const past = all.filter((s) => s.state !== "running");
+  const sig = `sel=${selSpawn}|` + all.map((s) => `${s.id}:${s.state}`).join("|");
+  if (sig === listSig && body.dataset.sig === sig) return;
+  listSig = sig;
+  body.dataset.sig = sig;
+  body.innerHTML = "";
+  // Flat list, running first: no collapsing. One glance, everything.
+  for (const s of running) body.appendChild(agentRow(s, s.id === selSpawn));
+  for (const s of past) body.appendChild(agentRow(s, s.id === selSpawn));
+}
+
+function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
+  const row = el("button", "agentrow" + (selected ? " cur" : ""),
+    spawnDot(s.state) +
+    `<span class="fname">${esc(s.label)}</span>` +
+    `<span class="fcount">${esc(s.state)}${spawnElapsed(s) ? ` · ${esc(spawnElapsed(s))}` : ""}</span>`) as HTMLButtonElement;
+  row.title = s.id;
+  row.addEventListener("click", () => openSpawn(s.id));
+  const reveal = el("button", "sreveal", "chat") as HTMLButtonElement;
+  reveal.title = "Reveal in chat";
+  reveal.addEventListener("click", (e) => {
+    e.stopPropagation();
+    gotoSpawn(s.id);
+  });
+  row.appendChild(reveal);
+  if (s.state === "running") {
+    const steer = el("button", "ssteer", "steer") as HTMLButtonElement;
+    steer.title = "Steer this subagent";
+    steer.addEventListener("click", (e) => {
+      e.stopPropagation();
+      prefillSteer(s.runId ?? s.id);
+    });
+    row.appendChild(steer);
+    const x = el("button", "sstop", "stop") as HTMLButtonElement;
+    x.title = "Stop this subagent";
+    // Direct send: stopPropagation here would also hide the click from
+    // the document-level delegation, so don't rely on it.
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();
+      sendAgentCmd(`/agent-stop ${s.runId ?? s.id}`);
+    });
+    row.appendChild(x);
+  }
+  const del = el("button", "sdel", "×") as HTMLButtonElement;
+  del.title = "Delete this subagent and its transcript files";
+  del.dataset.id = s.id;
+  del.addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteSpawn(s.id);
+  });
+  row.appendChild(del);
+  return row;
+}
+
+// One transcript at a time: click a child → its full session transcript
+// renders here (same renderer as chat). Running ones re-poll; the count
+// guard avoids clobbering scroll when nothing changed.
+let selSpawn: string | null = null;
+let detailCount = -1;
+
+function gotoSpawn(id: string): void {
+  const cards = Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`)) as HTMLElement[];
+  const card = cards[cards.length - 1];
+  if (!card) return;
+  if (card.tagName === "DETAILS") (card as HTMLDetailsElement).open = true;
+  card.scrollIntoView({ block: "center" });
+}
+
+function openSpawn(id: string): void {
+  // Split view: transcript renders below the list, no navigation.
+  // Clicking the selected row again collapses its transcript.
+  selSpawn = selSpawn === id ? null : id;
+  detailCount = -1;
+  renderAgents();
+}
+
+async function renderSpawnDetail(id: string): Promise<void> {
+  const body = $("agenttranscript");
+  let messages: any[] = [];
+  try {
+    const data = await spawnTranscript.read(id);
+    messages = data.messages ?? [];
+  } catch (e: any) {
+    body.innerHTML = "";
+    body.dataset.detail = "";
+    body.appendChild(el("div", "msg sys", esc(`transcript unavailable: ${e.message ?? e}`)));
+    return;
+  }
+  // Selected child may have finished since: keep the header honest.
+  if (selSpawn !== id) return;
+  if (detailCount === messages.length && body.dataset.detail === id) return;
+  detailCount = messages.length;
+  const keepScroll = body.scrollTop;
+  const nearBottom = body.scrollHeight - keepScroll - body.clientHeight < 120 || !body.hasChildNodes();
+  body.innerHTML = "";
+  body.dataset.detail = id;
+  const calls = new Map<string, any>();
+  for (const m of messages) {
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b && b.type === "toolCall" && b.id) calls.set(b.id, b);
+    }
+  }
+  // Borrow the chat renderer; quarantine its Activity-container pointer
+  // so detail containers never leak into the main view's run state.
+  const keepRun = lastRun;
+  lastRun = null;
+  try {
+    let run: HTMLElement | null = null;
+    const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
+    let shown = 0;
+    for (const m of messages) {
+      if (m.role === "system") continue;
+      if (m.role === "user") run = null;
+      if (m.role === "assistant" && Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (b && b.type === "thinking" && b.thinking) {
+            run = runAppend(body, run, thoughtDiv(b.thinking));
+          }
+        }
+      }
+      if (isTool(m)) {
+        run = runAppend(body, run, msgNode(m, calls));
+        shown++;
+        continue;
+      }
+      if (m.role === "assistant" && !textOf(m.content)) continue;
+      if (m.role === "custom" && !(typeof m.customType === "string" && m.customType.startsWith("spawn-"))) continue;
+      if (m.role === "custom" && (m as any).display === false) continue;
+      body.appendChild(msgNode(m, calls));
+      if (m.role === "assistant") run = null;
+      shown++;
+    }
+    if (!shown) body.appendChild(el("div", "msg sys", "No transcript yet — child hasn't produced output."));
+    collectEdits(messages, calls);
+    wireCopy(body);
+  } finally {
+    lastRun = keepRun;
+  }
+  if (nearBottom) body.scrollTop = body.scrollHeight;
+  else body.scrollTop = keepScroll;
+}
+
+// setSidePane owns visibility now (single shared sidebar); the old
+// per-pane setters are gone. Header buttons toggle their tab.
+
+
+// Direct delete: filesystem business, never touches the agent. Running
+// children are stopped first (theirs to wind down), then files go.
+// No chat message — the row vanishing IS the feedback.
+async function deleteSpawn(id: string): Promise<void> {
+  const s = spawns.get(id);
+  if (s?.state === "running") {
+    try {
+      await pi.prompt(cwd, `/agent-stop ${id}`);
+    } catch { /* already gone */ }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  try {
+    await spawnTranscript.remove(id);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
+    return;
+  }
+  burySpawn(id);
+  spawns.delete(id);
+  if (selSpawn === id) {
+    selSpawn = null;
+    detailCount = -1;
+  }
+  listSig = "";
+  updateAgentsBtn();
+  if (agentsVisible()) renderAgents();
+}
+
+// Fire-and-forget agent command (handled disposition: no run starts, no
+// agent_settled follows). Live spawn-note events append via route(); the
+// delayed rebuild covers a missed event. Never touches run UI.
+async function sendAgentCmd(text: string): Promise<void> {
+  hideCmdList();
+  try {
+    await pi.prompt(cwd, text);
+  } catch (e: any) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`agent command failed: ${e.message ?? e}`)));
+    return;
+  }
+  if (!streaming) setTimeout(() => { if (!streaming) refreshMsgs(); }, 1200);
+}
+
+function prefillSteer(id: string): void {
+  const inp = $("input") as HTMLTextAreaElement;
+  inp.value = `/agent-steer ${id} `;
+  inp.style.height = "auto";
+  inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+  syncSendBtn();
+  inp.focus();
 }
 
 // ---- streaming ----
@@ -921,6 +1362,7 @@ let refreshActive = false;
 async function refreshMsgs() {
   const box = $("msgs");
   box.innerHTML = "";
+  spawns.clear();
   // Authoritative wipe: drop live partials too (stream preview, partial
   // Activity, half-streamed thought). Post-wipe deltas rebuild cleanly;
   // without this they write into a detached tree and vanish.
@@ -983,6 +1425,11 @@ async function refreshMsgs() {
       // Textless assistant turns (tool-call-only) would flash as empty
       // boxes; their content already lives in the Activity container.
       if (m.role === "assistant" && !textOf(m.content)) continue;
+      // Silent customs (display:false): track (tombstones) but never render.
+      if (m.role === "custom" && (m as any).display === false) {
+        trackSpawn(m);
+        continue;
+      }
       // Mirror: repeats render. (Dedup was ours; pi shows them.)
       const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
       const n = msgNode(m, calls, fid);
@@ -995,7 +1442,7 @@ async function refreshMsgs() {
       shown++;
     }
     collectEdits(arr, calls);
-    if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+    if (changesVisible()) renderDiffPane();
     if (!shown) {
       const g = el("div", "greet", `<h2>Ready when you are.</h2>`);
       box.appendChild(g);
@@ -1377,6 +1824,12 @@ async function doRevert(entryId: string) {
 function resetRunState() {
   streaming = false;
   clearMediaCache();
+  spawns.clear();
+  selSpawn = null;
+  detailCount = -1;
+  listSig = "";
+  updateAgentsBtn();
+  if (agentsVisible()) renderAgents();
   streamDiv?.remove();
   streamDiv = null;
   streamBuf = "";
@@ -1390,7 +1843,7 @@ function resetRunState() {
   diffFiles.clear();
   selKey = null;
   viewRef = null;
-  if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+  if (changesVisible()) renderDiffPane();
   syncSendBtn();
   hideThinking();
 }
@@ -1837,6 +2290,24 @@ async function openSettings() {
       speakTurn(ts);
       return;
     }
+    const sstop = (e.target as HTMLElement).closest?.(".sstop") as HTMLButtonElement | null;
+    if (sstop?.dataset.id) {
+      e.stopPropagation();
+      sendAgentCmd(`/agent-stop ${sstop.dataset.id}`);
+      return;
+    }
+    const ssteer = (e.target as HTMLElement).closest?.(".ssteer") as HTMLButtonElement | null;
+    if (ssteer?.dataset.id) {
+      e.stopPropagation();
+      prefillSteer(ssteer.dataset.id);
+      return;
+    }
+    const sdel = (e.target as HTMLElement).closest?.(".sdel") as HTMLButtonElement | null;
+    if (sdel?.dataset.id) {
+      e.stopPropagation();
+      deleteSpawn(sdel.dataset.id);
+      return;
+    }
     const b = (e.target as HTMLElement).closest?.(".act-copy") as HTMLButtonElement | null;
     if (!b) return;
     doCopy(b);
@@ -1930,15 +2401,41 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   scrollerEl.addEventListener("scroll", scroller);
   ($("diffbtn") as HTMLButtonElement).addEventListener("click", () => {
-    setDiffPane($("diffpane").classList.contains("hidden"));
+    setSidePane(changesVisible() ? null : "changes");
   });
-  ($("diffclose") as HTMLButtonElement).addEventListener("click", () => {
-    setDiffPane(false);
+  ($("agentsbtn") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane(agentsVisible() ? null : "agents");
   });
-  const rp = $("diffpane");
-  const savedW = Number(localStorage.getItem("diffpane-w") || 0);
+  ($("sideclose") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane(null);
+  });
+  ($("tabchanges") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane("changes");
+  });
+  ($("tabagents") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane("agents");
+  });
+  // Elapsed ticking for running subagents: badge + open panel + inline
+  // cards. Static elapsed on a live card reads broken within seconds.
+  setInterval(() => {
+    if (!spawns.size) return;
+    let anyRunning = false;
+    for (const [id, s] of spawns) {
+      if (s.state !== "running") continue;
+      anyRunning = true;
+      for (const card of Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
+        const t = card.querySelector(":scope > summary .spelapsed");
+        if (t) t.textContent = spawnElapsed(s);
+      }
+    }
+    if (!anyRunning) return;
+    updateAgentsBtn();
+    if (agentsVisible()) renderAgents();
+  }, 5000);
+  const rp = $("sidepane");
+  const savedW = Number(localStorage.getItem("sidepane-w") || localStorage.getItem("diffpane-w") || 0);
   if (savedW >= 280 && savedW <= 900) rp.style.flexBasis = savedW + "px";
-  ($("diffresize") as HTMLElement).addEventListener("mousedown", (e) => {
+  ($("sideresize") as HTMLElement).addEventListener("mousedown", (e) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = rp.getBoundingClientRect().width;
@@ -1948,7 +2445,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const up = () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
-      localStorage.setItem("diffpane-w", String(Math.round(rp.getBoundingClientRect().width)));
+      localStorage.setItem("sidepane-w", String(Math.round(rp.getBoundingClientRect().width)));
     };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
@@ -1966,7 +2463,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       noteDiff(ref);
       selKey = diffKey(ref.tool, ref.path);
       viewRef = diffFiles.get(selKey) ?? ref;
-      if (!$("diffpane").classList.contains("hidden")) renderDiffPane();
+      if (changesVisible()) renderDiffPane();
     }
   }, true);
   ($("scrollbtn") as HTMLButtonElement).addEventListener("click", () => {

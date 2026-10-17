@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn, ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.PORT || 1421);
 const HOME = os.homedir();
@@ -103,6 +104,16 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   } catch {}
   const args = ["--mode", "rpc"];
   if (primer) args.push("--append-system-prompt", primer);
+  // App-owned subagents (see agent/SPAWN.md). Resolved relative to this
+  // file in dev; env override for custom layouts; skipped when absent.
+  let spawnExt =
+    process.env.PI_DESKTOP_SPAWN_EXT ||
+    new URL("../agent/spawn.ts", import.meta.url);
+  try {
+    if (typeof spawnExt !== "string") spawnExt = fileURLToPath(spawnExt);
+    fs.statSync(spawnExt);
+    args.push("--extension", spawnExt);
+  } catch { /* pi runs without spawn */ }
   if (sessionDir) args.push("--session-dir", sessionDir);
   if (sessionPath) args.push("--session", sessionPath);
   const child = spawn(piBin(), args, { cwd, stdio: ["pipe", "pipe", "ignore"] });
@@ -296,6 +307,38 @@ const handlers = {
     const resolved = path.resolve(p.path);
     if (!resolved.startsWith(root)) throw new Error("refusing to delete outside session dir");
     fs.unlinkSync(resolved);
+    return null;
+  },
+  read_spawn_transcript: (p) => {
+    const runId = p.run_id ?? p.runId ?? "";
+    if (!runId || runId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error("invalid run id");
+    const dir = path.join(HOME, ".pi", "agent", "spawn-sessions", runId);
+    let file = null;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(".jsonl")) continue;
+      if (file) throw new Error("ambiguous spawn dir (multiple sessions)");
+      file = path.join(dir, f);
+    }
+    if (!file) throw new Error("no session file for run");
+    const st = fs.statSync(file);
+    if (st.size > 2 * 1024 * 1024) throw new Error("spawn transcript too large (>2MB)");
+    const messages = [];
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      const v = JSON.parse(t);
+      if (v.type === "message" && v.message) messages.push(v.message);
+      if (messages.length >= 2000) break;
+    }
+    return { messages };
+  },
+  delete_spawn_run: (p) => {
+    const runId = p.runId ?? "";
+    if (!runId || runId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error("invalid run id");
+    const root = path.join(HOME, ".pi", "agent", "spawn-sessions");
+    const dir = path.resolve(root, runId);
+    if (path.dirname(dir) !== path.resolve(root)) throw new Error("refusing to delete outside spawn root");
+    fs.rmSync(dir, { recursive: true, force: true });
     return null;
   },
   get_config: () => CONFIG,

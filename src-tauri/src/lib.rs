@@ -22,6 +22,41 @@ use tauri_plugin_global_shortcut::ShortcutState;
 // gambling. web-backend.mjs reads the same file for browser dev.
 const MEDIA_PRIMER: &str = include_str!("../../src/media-primer.md");
 
+// App-owned subagents (see agent/SPAWN.md + agent/spawn.ts): one primitive,
+// sessions all the way down. Resolved at runtime so dev (repo present)
+// and installed builds (resource bundle, env override) all work; missing
+// file means the flag is skipped and pi runs without spawn (graceful).
+fn spawn_ext_path(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PI_DESKTOP_SPAWN_EXT") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    // Installed bundle: Tauri `bundle.resources` places it here.
+    if let Ok(rd) = app.path().resource_dir() {
+        let bundled = rd.join("agent").join("spawn.ts");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Dev layout: src-tauri/target/<profile>/pi-desktop → repo/agent/spawn.ts
+            let dev = dir.join("../../../agent/spawn.ts");
+            if dev.is_file() {
+                return Some(dev);
+            }
+            // Installed layout: <dir>/agent/spawn.ts next to the binary.
+            let next = dir.join("agent/spawn.ts");
+            if next.is_file() {
+                return Some(next);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------- config
 
 fn bg_default() -> bool {
@@ -172,6 +207,10 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // App-owned subagents ride along with every child; absence is fine.
+    if let Some(ext) = spawn_ext_path(&app) {
+        cmd.arg("--extension").arg(ext);
+    }
     if let Some(sd) = session_dir {
         if !sd.is_empty() {
             cmd.arg("--session-dir").arg(sd);
@@ -457,6 +496,85 @@ fn delete_session(path: String, session_root: Option<String>) -> Result<(), Stri
     fs::remove_file(&p).map_err(|e| e.to_string())
 }
 
+/// Transcript of one spawned subagent (see agent/SPAWN.md). Scoped to the
+/// spawn-sessions root: run ids are `[A-Za-z0-9_-]+`, no path traversal,
+/// one session file per run dir. Returns `{messages}` in get_messages
+/// shape so the frontend renders it with the same renderer. Bounded.
+#[tauri::command]
+fn read_spawn_transcript(run_id: String) -> Result<serde_json::Value, String> {
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid run id".into());
+    }
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let dir = home.join(".pi").join("agent").join("spawn-sessions").join(&run_id);
+    let mut session_file: Option<PathBuf> = None;
+    let entries = fs::read_dir(&dir).map_err(|e| format!("unreadable spawn dir: {e}"))?;
+    for e in entries {
+        let e = e.map_err(|e| e.to_string())?;
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            if session_file.is_some() {
+                return Err("ambiguous spawn dir (multiple sessions)".into());
+            }
+            session_file = Some(p);
+        }
+    }
+    let file = session_file.ok_or("no session file for run")?;
+    let meta = fs::metadata(&file).map_err(|e| format!("unreadable session file: {e}"))?;
+    if meta.len() > 2 * 1024 * 1024 {
+        return Err("spawn transcript too large (>2MB)".into());
+    }
+    let text = fs::read_to_string(&file).map_err(|e| format!("unreadable session file: {e}"))?;
+    let mut messages = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("bad session line: {e}"))?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("message") {
+            if let Some(m) = v.get("message").cloned() {
+                messages.push(m);
+            }
+        }
+        if messages.len() >= 2000 {
+            break;
+        }
+    }
+    Ok(serde_json::json!({ "messages": messages }))
+}
+
+/// Delete one spawned subagent's run dir (see agent/SPAWN.md). Scoped to
+/// the spawn-sessions root: run ids are `[A-Za-z0-9_-]+`, resolved path
+/// must stay inside the root. Removes transcript files outright.
+#[tauri::command]
+fn delete_spawn_run(run_id: String) -> Result<(), String> {
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid run id".into());
+    }
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let root = home.join(".pi").join("agent").join("spawn-sessions");
+    let dir = root.join(&run_id);
+    // Containment: canonicalize the parent (root always exists when a
+    // run does) and require the target to be exactly one entry inside.
+    if !dir.is_dir() {
+        return Ok(()); // already gone: idempotent
+    }
+    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable spawn root: {e}"))?;
+    let canonical = fs::canonicalize(&dir).map_err(|e| format!("unreadable spawn dir: {e}"))?;
+    if canonical.parent() != Some(canonical_root.as_path()) {
+        return Err("refusing to delete outside spawn root".into());
+    }
+    fs::remove_dir_all(&canonical).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- config
 
 #[tauri::command]
@@ -735,6 +853,8 @@ pub fn run() {
             list_sessions,
             delete_session,
             read_media,
+            read_spawn_transcript,
+            delete_spawn_run,
             get_config,
             set_config,
             toggle_quickbar,
